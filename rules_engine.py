@@ -259,3 +259,67 @@ def validate_label(extracted_data):
         "percentage": round((passed_count / total_count) * 100, 2),
         "results": results
     }
+
+def evaluate_all_rules(raw_lines: list[str], package_height_cm: float = 15.0, package_width_cm: float = 10.0, detected_font_height_mm: float = 2.5) -> dict:
+    """
+    Adapter function that converts OCR raw lines into structured fields
+    and executes validate_label().
+    """
+    full_text = " ".join(raw_lines)
+    lower_text = full_text.lower()
+
+    # Heuristic extraction from raw OCR lines
+    extracted_data = {
+        "mrp": None,
+        "manufacturer": None,
+        "net_quantity": None,
+        "mfg_date": None,
+        "consumer_care": None,
+        "country_of_origin": None,
+        "unit_sale_price": None,
+        "font_height_mm": float(detected_font_height_mm),
+        "metadata": {
+            "shape": "rectangular",
+            "height_cm": float(package_height_cm),
+            "width_cm": float(package_width_cm),
+            "is_blown": False
+        }
+    }
+
+    # 1. MRP & Currency Match
+    mrp_match = re.search(r"(?:mrp|max(?:imum)?\s*retail\s*price)[:\s]*(?:rs\.?|₹|inr)?\s*(\d+(?:\.\d+)?)", lower_text)
+    if mrp_match or "mrp" in lower_text or "₹" in full_text or "rs." in lower_text:
+        extracted_data["mrp"] = mrp_match.group(0) if mrp_match else "MRP detected"
+
+    # 2. Manufacturer Details Match
+    mfg_match = re.search(r"(?:mfd|manufactured|packed|marketed|imported)\s*by[:\s]*([^,\n]+(?:,[^,\n]+)*)", lower_text)
+    if mfg_match or any(k in lower_text for k in ["mfd by", "manufactured by", "packed by", "marketed by"]):
+        extracted_data["manufacturer"] = mfg_match.group(0) if mfg_match else "Manufacturer declared"
+
+    # 3. Net Quantity Match
+    qty_match = re.search(r"(?:net\s*(?:qty|quantity|wt|weight)?[:\s]*)?(\d+(?:\.\d+)?)\s*(kg|g|gm|gms|ml|l|ltr|pcs|units|n)\b", lower_text)
+    if qty_match:
+        extracted_data["net_quantity"] = qty_match.group(0)
+
+    # 4. Date of Manufacture Match
+    date_match = re.search(r"(?:mfd|mfg|packed|pkd|date)[:\s]*([0-1]?[0-9][/-](?:20)?[2-3][0-9]|[a-z]{3}[/-]?(?:20)?[2-3][0-9])", lower_text)
+    if date_match or any(k in lower_text for k in ["mfd", "mfg", "pkd", "packed"]):
+        extracted_data["mfg_date"] = date_match.group(0) if date_match else "Date declared"
+
+    # 5. Consumer Care Match
+    phone_match = re.search(r"\b(?:\+91|0)?[6-9]\d{9}\b|\b1800[- ]?\d{3}[- ]?\d{3,4}\b", full_text)
+    email_match = re.search(r"[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}", lower_text)
+    if phone_match or email_match or any(k in lower_text for k in ["customer care", "helpline", "toll free", "feedback"]):
+        extracted_data["consumer_care"] = (email_match.group(0) if email_match else None) or (phone_match.group(0) if phone_match else "Helpline declared")
+
+    # 6. Country of Origin Match
+    origin_match = re.search(r"(?:country of origin|made in|origin)[:\s]*([a-z]+)", lower_text)
+    if origin_match or "made in" in lower_text or "india" in lower_text:
+        extracted_data["country_of_origin"] = origin_match.group(0) if origin_match else "India"
+
+    # 7. Unit Sale Price Match
+    usp_match = re.search(r"(?:usp|unit\s*sale\s*price|rate)[:\s]*(?:rs\.?|inr|₹)?\s*(\d+(?:\.\d+)?)\s*(?:\/|per)\s*(?:g|kg|ml|l|pcs|piece|unit)", lower_text)
+    if usp_match:
+        extracted_data["unit_sale_price"] = usp_match.group(0)
+
+    return validate_label(extracted_data)

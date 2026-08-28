@@ -30,7 +30,7 @@ UI_HTML = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Pramand_AI — LMPC Compliance Inspector</title>
+    <title>PramanAI — LMPC Compliance Inspector</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
     <style>
@@ -50,7 +50,7 @@ UI_HTML = """
                     <i class="fa-solid fa-scale-balanced text-white text-base"></i>
                 </div>
                 <div>
-                    <h1 class="font-bold text-base sm:text-lg tracking-tight text-white leading-tight">Pramand_AI</h1>
+                    <h1 class="font-bold text-base sm:text-lg tracking-tight text-white leading-tight">PramanAI</h1>
                     <p class="text-[10px] sm:text-xs text-blue-400 font-medium tracking-wide leading-none">LMPC Act 2011 Engine</p>
                 </div>
             </div>
@@ -233,7 +233,7 @@ UI_HTML = """
 
     <!-- Footer -->
     <footer class="bg-slate-950 border-t border-slate-800 text-center py-4 px-4 text-slate-500 text-xs mt-auto">
-        <p>Pramand_AI — Legal Metrology Act 2009 & Packaged Commodities Rules 2011 Automated Regulatory Engine</p>
+        <p>PramanAI — Legal Metrology Act 2009 & Packaged Commodities Rules 2011 Automated Regulatory Engine</p>
     </footer>
 
     <script>
@@ -414,11 +414,11 @@ def export_official_notice_pdf():
     if not latest_report_cache:
         raise HTTPException(status_code=400, detail="No scan data found. Please perform an inspection scan first.")
 
-    output_pdf_path = "Pramand_AI_Inspection_Notice.pdf"
+    output_pdf_path = "PramanAI_Inspection_Notice.pdf"
     generate_pdf_report(latest_report_cache, output_path=output_pdf_path)
 
     return FileResponse(
         path=output_pdf_path,
         media_type="application/pdf",
-        filename="Pramand_AI_Inspection_Notice.pdf"
+        filename="PramanAI_Inspection_Notice.pdf"
     )

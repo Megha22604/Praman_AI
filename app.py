@@ -1,894 +1,424 @@
-from fastapi.responses import FileResponse, HTMLResponse
-from fastapi import FastAPI, UploadFile, File, Form
-from fastapi.responses import FileResponse
-from typing import List, Optional
-from parser import parse_raw_ocr_lines
-from rules_engine import validate_label
-from report_generator import generate_pdf_report
+import io
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException
+from fastapi.responses import HTMLResponse, FileResponse
+from fastapi.middleware.cors import CORSMiddleware
+
 from ocr_engine import extract_text_lines_from_image
-from fastapi.responses import FileResponse
+from rules_engine import evaluate_all_rules
 from report_generator import generate_pdf_report
-from fastapi import FastAPI
-from pydantic import BaseModel
-from typing import List, Optional
-from parser import parse_raw_ocr_lines
-from rules_engine import validate_label
 
 app = FastAPI(
-    title="LMPC Legal Metrology Compliance Engine",
+    title="Pramand_AI Compliance Engine",
+    description="Automated Legal Metrology (Packaged Commodities) Rules, 2011 Verification Engine",
     version="1.0.0"
 )
 
-class PackageMetadataInput(BaseModel):
-    shape: str = "rectangular"
-    height_cm: Optional[float] = 0.0
-    width_cm: Optional[float] = 0.0
-    circumference_cm: Optional[float] = 0.0
-    total_surface_area_cm2: Optional[float] = 0.0
-    is_blown: bool = False
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-class ScanRequest(BaseModel):
-    raw_ocr_lines: List[str]
-    font_height_mm: Optional[float] = None
-    metadata: Optional[PackageMetadataInput] = None
+# In-memory storage for the latest generated scan report
+latest_report_cache = {}
 
-@app.get("/")
-def root():
-    return {"status": "online", "system": "LMPC Rules Compliance API"}
+UI_HTML = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Pramand_AI — LMPC Compliance Inspector</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+    <style>
+        /* Smooth scrolling and native touch feel */
+        html { -webkit-tap-highlight-color: transparent; }
+        .custom-scrollbar::-webkit-scrollbar { height: 6px; width: 6px; }
+        .custom-scrollbar::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 4px; }
+    </style>
+</head>
+<body class="bg-slate-900 text-slate-100 min-h-screen flex flex-col font-sans selection:bg-blue-600 selection:text-white">
 
-@app.post("/api/audit")
-def audit_label(request: ScanRequest):
-    # Step 1: Parse raw OCR lines into structured fields
-    parsed_fields = parse_raw_ocr_lines(request.raw_ocr_lines)
+    <!-- Top Navigation Bar -->
+    <header class="bg-slate-800/90 backdrop-blur-md border-b border-slate-700 sticky top-0 z-50">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 py-3.5 flex items-center justify-between">
+            <div class="flex items-center space-x-3">
+                <div class="h-9 w-9 bg-gradient-to-tr from-blue-600 to-indigo-500 rounded-lg flex items-center justify-center shadow-lg shadow-blue-500/30">
+                    <i class="fa-solid fa-scale-balanced text-white text-base"></i>
+                </div>
+                <div>
+                    <h1 class="font-bold text-base sm:text-lg tracking-tight text-white leading-tight">Pramand_AI</h1>
+                    <p class="text-[10px] sm:text-xs text-blue-400 font-medium tracking-wide leading-none">LMPC Act 2011 Engine</p>
+                </div>
+            </div>
+            <div class="flex items-center space-x-2">
+                <span class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-medium bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
+                    <span class="h-1.5 w-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
+                    Live
+                </span>
+                <a href="/docs" target="_blank" class="p-2 text-slate-400 hover:text-white transition rounded-lg hover:bg-slate-700/50">
+                    <i class="fa-solid fa-book-open text-sm"></i>
+                </a>
+            </div>
+        </div>
+    </header>
 
-    # Step 2: Attach spatial measurements if provided
-    if request.font_height_mm is not None:
-        parsed_fields["font_height_mm"] = request.font_height_mm
-    
-    if request.metadata:
-        parsed_fields["metadata"] = request.metadata.model_dump()
+    <!-- Main Container -->
+    <main class="flex-1 max-w-7xl w-full mx-auto p-3 sm:p-6 lg:p-8 space-y-6">
+        
+        <!-- Hero Header -->
+        <div class="text-center sm:text-left space-y-1.5 pt-2">
+            <h2 class="text-xl sm:text-2xl lg:text-3xl font-extrabold text-white tracking-tight">Package Label Audit</h2>
+            <p class="text-xs sm:text-sm text-slate-400 max-w-2xl">
+                Upload front/back packaging labels to detect statutory declarations under the Legal Metrology (Packaged Commodities) Rules, 2011.
+            </p>
+        </div>
 
-    # Step 3: Run deterministic legal verification
-    report = validate_label(parsed_fields)
+        <div class="grid grid-cols-1 lg:grid-cols-12 gap-5 sm:gap-6">
+            
+            <!-- Form Card (Left Column) -->
+            <div class="lg:col-span-5 space-y-5">
+                <div class="bg-slate-800/80 border border-slate-700/80 rounded-2xl p-4 sm:p-6 shadow-xl space-y-5">
+                    
+                    <form id="auditForm" class="space-y-4" onsubmit="handleFormSubmit(event)">
+                        
+                        <!-- Upload Box -->
+                        <div>
+                            <label class="block text-xs sm:text-sm font-semibold text-slate-200 mb-2">Upload Label Image</label>
+                            <div class="relative group">
+                                <input type="file" id="imageInput" accept="image/*" required onchange="previewImage(this)"
+                                    class="absolute inset-0 w-full h-full opacity-0 cursor-pointer z-10">
+                                <div id="dropZone" class="border-2 border-dashed border-slate-600 group-hover:border-blue-500 bg-slate-900/60 rounded-xl p-5 text-center transition flex flex-col items-center justify-center space-y-2.5">
+                                    <div class="w-11 h-11 bg-slate-800 rounded-full flex items-center justify-center text-slate-400 group-hover:text-blue-400 group-hover:scale-105 transition">
+                                        <i class="fa-solid fa-cloud-arrow-up text-lg"></i>
+                                    </div>
+                                    <div class="space-y-0.5">
+                                        <p class="text-xs sm:text-sm font-medium text-slate-300" id="uploadText">Tap to capture or choose file</p>
+                                        <p class="text-[10px] sm:text-xs text-slate-500">PNG, JPG up to 10MB</p>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
 
-    return {
-        "parsed_fields": parsed_fields,
-        "compliance_report": report
-    }
-@app.post("/api/audit/pdf")
-def audit_and_generate_pdf(request: ScanRequest):
-    # Process compliance check
-    parsed_fields = parse_raw_ocr_lines(request.raw_ocr_lines)
-    if request.font_height_mm is not None:
-        parsed_fields["font_height_mm"] = request.font_height_mm
-    if request.metadata:
-        parsed_fields["metadata"] = request.metadata.model_dump()
+                        <!-- Image Preview -->
+                        <div id="previewContainer" class="hidden relative rounded-xl overflow-hidden border border-slate-700 bg-slate-950/80 max-h-52">
+                            <img id="imagePreview" src="#" alt="Preview" class="w-full h-48 object-contain">
+                            <button type="button" onclick="clearImage()" class="absolute top-2 right-2 bg-rose-600/90 text-white rounded-full p-1.5 shadow-md hover:bg-rose-500 transition">
+                                <i class="fa-solid fa-xmark text-xs w-4 h-4 flex items-center justify-center"></i>
+                            </button>
+                        </div>
 
-    report = validate_label(parsed_fields)
-    
-    # Generate PDF
-    pdf_filename = "inspection_report.pdf"
-    generate_pdf_report({"compliance_report": report}, output_path=pdf_filename)
-    
-    return FileResponse(
-        path=pdf_filename,
-        media_type="application/pdf",
-        filename=pdf_filename
-    )
+                        <!-- Physical Dimensions Card -->
+                        <div class="bg-slate-900/50 border border-slate-700/60 rounded-xl p-3.5 space-y-3">
+                            <p class="text-xs font-semibold text-slate-300 flex items-center gap-1.5">
+                                <i class="fa-solid fa-ruler-combined text-blue-400"></i> Dimensions & Font (Optional)
+                            </p>
+                            <div class="grid grid-cols-2 gap-2.5">
+                                <div>
+                                    <label class="block text-[11px] text-slate-400 mb-1">Height (cm)</label>
+                                    <input type="number" step="0.1" id="pkg_height" value="15.0"
+                                        class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-1.5 text-xs text-white focus:outline-none focus:border-blue-500">
+                                </div>
+                                <div>
+                                    <label class="block text-[11px] text-slate-400 mb-1">Width (cm)</label>
+                                    <input type="number" step="0.1" id="pkg_width" value="10.0"
+                                        class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-1.5 text-xs text-white focus:outline-none focus:border-blue-500">
+                                </div>
+                                <div class="col-span-2">
+                                    <label class="block text-[11px] text-slate-400 mb-1">Detected Font Height (mm)</label>
+                                    <input type="number" step="0.1" id="font_height" value="2.5"
+                                        class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-1.5 text-xs text-white focus:outline-none focus:border-blue-500">
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Submit Button -->
+                        <button type="submit" id="submitBtn"
+                            class="w-full bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 text-white font-semibold py-3 px-4 rounded-xl shadow-lg shadow-blue-500/25 transition active:scale-[0.99] flex items-center justify-center space-x-2 text-sm">
+                            <i class="fa-solid fa-magnifying-glass"></i>
+                            <span>Run Verification Audit</span>
+                        </button>
+                    </form>
+                </div>
+            </div>
+
+            <!-- Results Column (Right Column) -->
+            <div class="lg:col-span-7 space-y-5">
+                
+                <!-- Loading State -->
+                <div id="loadingState" class="hidden bg-slate-800/60 border border-slate-700/60 rounded-2xl p-10 text-center space-y-3">
+                    <div class="inline-block animate-spin rounded-full h-10 w-10 border-4 border-slate-600 border-t-blue-500"></div>
+                    <p class="text-sm font-medium text-slate-300">Scanning package declarations...</p>
+                    <p class="text-xs text-slate-500">Extracting OCR tokens & cross-referencing LMPC Rules 2011</p>
+                </div>
+
+                <!-- Empty Initial State -->
+                <div id="emptyState" class="bg-slate-800/40 border border-slate-700/50 border-dashed rounded-2xl p-8 sm:p-12 text-center flex flex-col items-center justify-center space-y-3">
+                    <div class="w-14 h-14 bg-slate-800 rounded-2xl flex items-center justify-center text-slate-500">
+                        <i class="fa-solid fa-clipboard-check text-2xl"></i>
+                    </div>
+                    <div class="space-y-1">
+                        <p class="text-sm font-medium text-slate-300">No Inspection Results Yet</p>
+                        <p class="text-xs text-slate-500 max-w-xs mx-auto">Upload a packaged product image on the left to generate the statutory compliance audit report.</p>
+                    </div>
+                </div>
+
+                <!-- Live Results View -->
+                <div id="resultsCard" class="hidden space-y-4">
+                    
+                    <!-- Score Banner -->
+                    <div id="statusBanner" class="rounded-2xl p-4 sm:p-5 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 shadow-lg border">
+                        <div class="space-y-0.5">
+                            <div class="flex items-center space-x-2">
+                                <span id="statusIcon"></span>
+                                <h3 id="statusTitle" class="text-base sm:text-lg font-bold"></h3>
+                            </div>
+                            <p id="statusSubtitle" class="text-xs opacity-90"></p>
+                        </div>
+                        <a href="/api/export-pdf" id="downloadPdfBtn"
+                            class="w-full sm:w-auto inline-flex items-center justify-center space-x-2 px-4 py-2 rounded-xl text-xs font-semibold bg-white text-slate-900 shadow hover:bg-slate-100 active:scale-95 transition">
+                            <i class="fa-solid fa-file-arrow-down text-rose-600"></i>
+                            <span>Download PDF Notice</span>
+                        </a>
+                    </div>
+
+                    <!-- Findings Table Card -->
+                    <div class="bg-slate-800/80 border border-slate-700/80 rounded-2xl overflow-hidden shadow-xl">
+                        <div class="p-3.5 sm:p-4 border-b border-slate-700/80 flex items-center justify-between">
+                            <h4 class="text-xs sm:text-sm font-bold text-white flex items-center gap-2">
+                                <i class="fa-solid fa-list-check text-blue-400"></i> Statutory Checkpoints
+                            </h4>
+                            <span id="scoreBadge" class="text-[11px] font-bold px-2.5 py-0.5 rounded-full"></span>
+                        </div>
+
+                        <!-- Horizontal Scroll Container for Mobile -->
+                        <div class="overflow-x-auto custom-scrollbar">
+                            <table class="w-full text-left border-collapse min-w-[540px]">
+                                <thead>
+                                    <tr class="bg-slate-900/60 text-[11px] text-slate-400 font-semibold border-b border-slate-700/60 uppercase tracking-wider">
+                                        <th class="py-2.5 px-3.5">Declaration Field</th>
+                                        <th class="py-2.5 px-3">Statutory Rule</th>
+                                        <th class="py-2.5 px-3 text-center">Status</th>
+                                        <th class="py-2.5 px-3.5">Finding Details</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="resultsTableBody" class="divide-y divide-slate-700/40 text-xs">
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+
+                    <!-- Extracted OCR Text Log Card -->
+                    <div class="bg-slate-800/60 border border-slate-700/60 rounded-2xl p-4 space-y-2">
+                        <div class="flex items-center justify-between">
+                            <span class="text-xs font-semibold text-slate-300 flex items-center gap-1.5">
+                                <i class="fa-solid fa-receipt text-slate-400"></i> Extracted OCR Tokens
+                            </span>
+                            <span id="tokenCount" class="text-[10px] text-slate-500 font-mono"></span>
+                        </div>
+                        <div id="ocrTokens" class="p-3 bg-slate-950/70 rounded-xl font-mono text-[11px] text-slate-400 max-h-36 overflow-y-auto space-y-1 custom-scrollbar">
+                        </div>
+                    </div>
+
+                </div>
+
+            </div>
+
+        </div>
+
+    </main>
+
+    <!-- Footer -->
+    <footer class="bg-slate-950 border-t border-slate-800 text-center py-4 px-4 text-slate-500 text-xs mt-auto">
+        <p>Pramand_AI — Legal Metrology Act 2009 & Packaged Commodities Rules 2011 Automated Regulatory Engine</p>
+    </footer>
+
+    <script>
+        function previewImage(input) {
+            if (input.files && input.files[0]) {
+                const reader = new FileReader();
+                reader.onload = function(e) {
+                    document.getElementById('imagePreview').src = e.target.result;
+                    document.getElementById('previewContainer').classList.remove('hidden');
+                    document.getElementById('uploadText').innerText = input.files[0].name;
+                }
+                reader.readAsDataURL(input.files[0]);
+            }
+        }
+
+        function clearImage() {
+            document.getElementById('imageInput').value = '';
+            document.getElementById('imagePreview').src = '#';
+            document.getElementById('previewContainer').classList.add('hidden');
+            document.getElementById('uploadText').innerText = 'Tap to capture or choose file';
+        }
+
+        async function handleFormSubmit(e) {
+            e.preventDefault();
+            
+            const fileInput = document.getElementById('imageInput');
+            if (!fileInput.files || !fileInput.files[0]) {
+                alert('Please upload an image first.');
+                return;
+            }
+
+            const formData = new FormData();
+            formData.append('file', fileInput.files[0]);
+            formData.append('package_height_cm', document.getElementById('pkg_height').value || 15.0);
+            formData.append('package_width_cm', document.getElementById('pkg_width').value || 10.0);
+            formData.append('detected_font_height_mm', document.getElementById('font_height').value || 2.5);
+
+            // Toggle States
+            document.getElementById('emptyState').classList.add('hidden');
+            document.getElementById('resultsCard').classList.add('hidden');
+            document.getElementById('loadingState').classList.remove('hidden');
+            document.getElementById('submitBtn').disabled = true;
+
+            try {
+                const res = await fetch('/api/scan-image', {
+                    method: 'POST',
+                    body: formData
+                });
+
+                if (!res.ok) {
+                    const err = await res.json();
+                    throw new Error(err.detail || 'Audit processing failed.');
+                }
+
+                const data = await res.json();
+                renderResults(data);
+            } catch (err) {
+                alert('Error: ' + err.message);
+                document.getElementById('emptyState').classList.remove('hidden');
+            } finally {
+                document.getElementById('loadingState').classList.add('hidden');
+                document.getElementById('submitBtn').disabled = false;
+            }
+        }
+
+        function renderResults(data) {
+            const report = data.compliance_report;
+            const isCompliant = report.compliant;
+
+            // Status Banner
+            const banner = document.getElementById('statusBanner');
+            const icon = document.getElementById('statusIcon');
+            const title = document.getElementById('statusTitle');
+            const subtitle = document.getElementById('statusSubtitle');
+            const scoreBadge = document.getElementById('scoreBadge');
+
+            if (isCompliant) {
+                banner.className = 'rounded-2xl p-4 sm:p-5 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 shadow-lg border bg-emerald-950/40 border-emerald-500/30 text-emerald-300';
+                icon.innerHTML = '<i class="fa-solid fa-circle-check text-emerald-400 text-lg sm:text-xl"></i>';
+                title.innerText = 'Fully Compliant';
+                subtitle.innerText = 'All mandatory statutory declarations detected and validated.';
+                scoreBadge.className = 'text-[11px] font-bold px-2.5 py-0.5 rounded-full bg-emerald-500/20 text-emerald-400 border border-emerald-500/30';
+            } else {
+                banner.className = 'rounded-2xl p-4 sm:p-5 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 shadow-lg border bg-rose-950/40 border-rose-500/30 text-rose-300';
+                icon.innerHTML = '<i class="fa-solid fa-triangle-exclamation text-rose-400 text-lg sm:text-xl"></i>';
+                title.innerText = 'Non-Compliance Detected';
+                subtitle.innerText = 'One or more mandatory statutory declarations are missing or invalid.';
+                scoreBadge.className = 'text-[11px] font-bold px-2.5 py-0.5 rounded-full bg-rose-500/20 text-rose-400 border border-rose-500/30';
+            }
+            scoreBadge.innerText = report.score;
+
+            // Findings Table
+            const tbody = document.getElementById('resultsTableBody');
+            tbody.innerHTML = '';
+
+            report.results.forEach(item => {
+                const tr = document.createElement('tr');
+                tr.className = 'hover:bg-slate-800/40 transition';
+
+                const statusPill = item.pass 
+                    ? '<span class="inline-flex items-center px-2 py-0.5 rounded text-[10px] font-semibold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">PASS</span>'
+                    : '<span class="inline-flex items-center px-2 py-0.5 rounded text-[10px] font-semibold bg-rose-500/10 text-rose-400 border border-rose-500/20">FAIL</span>';
+
+                tr.innerHTML = `
+                    <td class="py-2.5 px-3.5 font-medium text-slate-200">${item.field}</td>
+                    <td class="py-2.5 px-3 text-slate-400 font-mono text-[11px]">${item.rule}</td>
+                    <td class="py-2.5 px-3 text-center">${statusPill}</td>
+                    <td class="py-2.5 px-3.5 text-slate-300 text-[11px]">${item.reason}</td>
+                `;
+                tbody.appendChild(tr);
+            });
+
+            // Raw OCR Token Display
+            const tokensBox = document.getElementById('ocrTokens');
+            tokensBox.innerHTML = '';
+            document.getElementById('tokenCount').innerText = `${data.detected_raw_lines.length} lines detected`;
+
+            data.detected_raw_lines.forEach(line => {
+                const div = document.createElement('div');
+                div.className = 'text-slate-300 py-0.5 border-b border-slate-900/40 last:border-0';
+                div.textContent = `> ${line}`;
+                tokensBox.appendChild(div);
+            });
+
+            document.getElementById('resultsCard').classList.remove('hidden');
+        }
+    </script>
+</body>
+</html>
+"""
+
+@app.get("/ui", response_class=HTMLResponse)
+def get_user_interface():
+    """Serves the responsive, mobile-first inspector UI."""
+    return HTMLResponse(content=UI_HTML)
+
 @app.post("/api/scan-image")
 async def scan_package_image(
     file: UploadFile = File(...),
-    shape: str = Form("rectangular"),
-    height_cm: float = Form(0.0),
-    width_cm: float = Form(0.0),
-    font_height_mm: Optional[float] = Form(None)
+    package_height_cm: float = Form(15.0),
+    package_width_cm: float = Form(10.0),
+    detected_font_height_mm: float = Form(2.5)
 ):
-    # 1. Read uploaded image bytes and run OCR
+    """
+    Ingests label image bytes, extracts OCR tokens, runs LMPC validation,
+    and caches the latest report for PDF export.
+    """
+    global latest_report_cache
+    
+    if not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="Uploaded file must be a valid image (PNG/JPG).")
+
     image_bytes = await file.read()
     raw_lines = extract_text_lines_from_image(image_bytes)
 
-    # 2. Parse detected text into legal entities
-    parsed_fields = parse_raw_ocr_lines(raw_lines)
-    
-    # 3. Attach spatial measurements
-    parsed_fields["font_height_mm"] = font_height_mm
-    parsed_fields["metadata"] = {
-        "shape": shape,
-        "height_cm": height_cm,
-        "width_cm": width_cm,
-        "circumference_cm": 0.0,
-        "total_surface_area_cm2": 0.0,
-        "is_blown": False
+    compliance_results = evaluate_all_rules(
+        raw_lines=raw_lines,
+        package_height_cm=package_height_cm,
+        package_width_cm=package_width_cm,
+        detected_font_height_mm=detected_font_height_mm
+    )
+
+    response_payload = {
+        "status": "success",
+        "detected_raw_lines": raw_lines,
+        "compliance_report": compliance_results
     }
 
-    # 4. Run rules validation
-    report = validate_label(parsed_fields)
+    # Store for PDF generator
+    latest_report_cache = response_payload
 
-    return {
-        "ocr_detected_lines": raw_lines,
-        "parsed_fields": parsed_fields,
-        "compliance_report": report
-    }
-@app.get("/ui", response_class=HTMLResponse)
-def serve_ui():
-    return """
-    <!DOCTYPE html>
-    <html lang="en">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Pramand_AI — Food Metrology & Packaging Intelligence</title>
-        <link rel="preconnect" href="https://fonts.googleapis.com">
-        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-        <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
-        <style>
-            :root {
-                --bg-base: #f7f9f6;
-                --surface-card: #ffffff;
-                --surface-subtle: #f0f4ee;
-                --surface-hover: #eaf1e8;
-                
-                --primary: #1e4a38;
-                --primary-accent: #2e6f54;
-                --primary-light: #e8f3ee;
-                --primary-border: #c8dfd4;
-                
-                --olive: #557153;
-                --honey: #b45309;
-                --honey-bg: #fef3c7;
-                
-                --border: #e1e8df;
-                --border-focus: #2e6f54;
-                
-                --text-main: #14241d;
-                --text-muted: #5e7368;
-                --text-subtle: #8a9e94;
-                
-                --pass-bg: #ecf8f1;
-                --pass-text: #196c44;
-                --pass-border: #b7e4cb;
-                
-                --fail-bg: #fdf2f2;
-                --fail-text: #a82323;
-                --fail-border: #f8b4b4;
+    return response_payload
 
-                --shadow-sm: 0 1px 3px rgba(20, 36, 29, 0.04), 0 1px 2px rgba(20, 36, 29, 0.02);
-                --shadow-md: 0 4px 16px -2px rgba(20, 36, 29, 0.06), 0 2px 6px -1px rgba(20, 36, 29, 0.03);
-                --shadow-lg: 0 12px 32px -4px rgba(20, 36, 29, 0.08), 0 4px 12px -2px rgba(20, 36, 29, 0.03);
-            }
+@app.get("/api/export-pdf")
+def export_official_notice_pdf():
+    """Compiles and downloads the Official Digital Inspection Notice PDF."""
+    global latest_report_cache
+    if not latest_report_cache:
+        raise HTTPException(status_code=400, detail="No scan data found. Please perform an inspection scan first.")
 
-            * { box-sizing: border-box; margin: 0; padding: 0; }
-            html, body {
-                width: 100%;
-                min-height: 100vh;
-                background-color: var(--bg-base);
-                font-family: 'Plus Jakarta Sans', -apple-system, sans-serif;
-                color: var(--text-main);
-                font-size: 13.5px;
-                line-height: 1.5;
-                -webkit-font-smoothing: antialiased;
-            }
+    output_pdf_path = "Pramand_AI_Inspection_Notice.pdf"
+    generate_pdf_report(latest_report_cache, output_path=output_pdf_path)
 
-            /* Top Bar */
-            .navbar {
-                background: rgba(255, 255, 255, 0.85);
-                backdrop-filter: blur(16px);
-                border-bottom: 1px solid var(--border);
-                position: sticky;
-                top: 0;
-                z-index: 50;
-                padding: 14px 28px;
-            }
-            .navbar-inner {
-                max-width: 1320px;
-                margin: 0 auto;
-                display: flex;
-                align-items: center;
-                justify-content: space-between;
-            }
-            .brand-group {
-                display: flex;
-                align-items: center;
-                gap: 12px;
-            }
-            .brand-icon {
-                width: 34px;
-                height: 34px;
-                background: linear-gradient(135deg, #1e4a38 0%, #2e6f54 100%);
-                color: #ffffff;
-                border-radius: 10px;
-                display: grid;
-                place-items: center;
-                font-size: 16px;
-                box-shadow: 0 4px 10px rgba(30, 74, 56, 0.2);
-            }
-            .brand-title {
-                font-size: 16px;
-                font-weight: 800;
-                letter-spacing: -0.4px;
-                color: var(--primary);
-            }
-            .brand-badge {
-                font-size: 11px;
-                font-weight: 600;
-                background: var(--primary-light);
-                color: var(--primary);
-                padding: 3px 9px;
-                border-radius: 20px;
-                border: 1px solid var(--primary-border);
-            }
-            .meta-pill {
-                display: flex;
-                align-items: center;
-                gap: 8px;
-                font-size: 12px;
-                color: var(--text-muted);
-                background: var(--surface-subtle);
-                padding: 6px 12px;
-                border-radius: 20px;
-                border: 1px solid var(--border);
-            }
-            .live-dot {
-                width: 7px;
-                height: 7px;
-                border-radius: 50%;
-                background: #10b981;
-                box-shadow: 0 0 0 3px rgba(16, 185, 129, 0.2);
-            }
-
-            /* Container */
-            .container {
-                max-width: 1320px;
-                margin: 28px auto;
-                padding: 0 24px;
-            }
-
-            /* Tabs */
-            .tab-nav {
-                display: inline-flex;
-                background: var(--surface-subtle);
-                padding: 4px;
-                border-radius: 12px;
-                border: 1px solid var(--border);
-                margin-bottom: 24px;
-                gap: 4px;
-            }
-            .tab-btn {
-                padding: 8px 18px;
-                border: none;
-                background: transparent;
-                font-family: inherit;
-                font-size: 13px;
-                font-weight: 600;
-                color: var(--text-muted);
-                border-radius: 8px;
-                cursor: pointer;
-                transition: all 0.2s ease;
-            }
-            .tab-btn.active {
-                background: #ffffff;
-                color: var(--primary);
-                box-shadow: var(--shadow-sm);
-            }
-
-            /* Main Layout Grid */
-            .main-grid {
-                display: grid;
-                grid-template-columns: 360px minmax(0, 1fr);
-                gap: 24px;
-                align-items: start;
-            }
-            @media (max-width: 980px) {
-                .main-grid { grid-template-columns: 1fr; }
-            }
-
-            /* Card Styling */
-            .card {
-                background: var(--surface-card);
-                border: 1px solid var(--border);
-                border-radius: 16px;
-                box-shadow: var(--shadow-md);
-                overflow: hidden;
-            }
-            .card-header {
-                padding: 16px 20px;
-                border-bottom: 1px solid var(--border);
-                background: linear-gradient(180deg, #ffffff 0%, var(--surface-subtle) 100%);
-                display: flex;
-                align-items: center;
-                justify-content: space-between;
-            }
-            .card-title {
-                font-size: 13.5px;
-                font-weight: 700;
-                color: var(--primary);
-                letter-spacing: -0.2px;
-            }
-            .card-body {
-                padding: 20px;
-            }
-
-            /* Dropzone Preview */
-            .dropzone {
-                border: 2px dashed var(--primary-border);
-                background: #fbfdfa;
-                border-radius: 12px;
-                height: 150px;
-                display: flex;
-                flex-direction: column;
-                align-items: center;
-                justify-content: center;
-                overflow: hidden;
-                margin-bottom: 16px;
-                transition: all 0.2s ease;
-            }
-            .dropzone:hover {
-                background: var(--primary-light);
-                border-color: var(--primary-accent);
-            }
-            .dropzone img {
-                max-width: 100%;
-                max-height: 100%;
-                object-fit: contain;
-            }
-
-            /* Sophisticated Inputs */
-            .field-wrap { margin-bottom: 14px; }
-            .label {
-                display: block;
-                font-size: 11.5px;
-                font-weight: 600;
-                color: var(--text-muted);
-                margin-bottom: 6px;
-            }
-            input[type="text"], input[type="number"], select, textarea {
-                width: 100%;
-                padding: 10px 14px;
-                border-radius: 10px;
-                border: 1px solid var(--border);
-                background: #ffffff;
-                font-family: inherit;
-                font-size: 13px;
-                color: var(--text-main);
-                transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
-                box-shadow: 0 1px 2px rgba(0,0,0,0.02);
-            }
-            input:focus, select:focus, textarea:focus {
-                outline: none;
-                border-color: var(--primary-accent);
-                box-shadow: 0 0 0 3px rgba(46, 111, 84, 0.12);
-            }
-            .grid-2 {
-                display: grid;
-                grid-template-columns: 1fr 1fr;
-                gap: 12px;
-            }
-
-            /* File Upload Button */
-            .file-btn {
-                display: flex;
-                align-items: center;
-                justify-content: center;
-                gap: 8px;
-                width: 100%;
-                padding: 10px;
-                background: var(--surface-subtle);
-                border: 1px solid var(--border);
-                border-radius: 10px;
-                font-weight: 600;
-                font-size: 12.5px;
-                color: var(--primary);
-                cursor: pointer;
-                transition: all 0.2s;
-                margin-bottom: 14px;
-            }
-            .file-btn:hover {
-                background: var(--surface-hover);
-                border-color: var(--primary-border);
-            }
-            input[type="file"] { display: none; }
-
-            /* Primary Buttons */
-            .btn-action {
-                width: 100%;
-                padding: 12px 18px;
-                border: none;
-                border-radius: 10px;
-                font-family: inherit;
-                font-size: 13.5px;
-                font-weight: 700;
-                cursor: pointer;
-                display: flex;
-                align-items: center;
-                justify-content: center;
-                gap: 8px;
-                transition: all 0.2s ease;
-            }
-            .btn-audit {
-                background: linear-gradient(135deg, #1e4a38 0%, #2e6f54 100%);
-                color: #ffffff;
-                box-shadow: 0 4px 12px rgba(30, 74, 56, 0.2);
-            }
-            .btn-audit:hover {
-                box-shadow: 0 6px 18px rgba(30, 74, 56, 0.28);
-                transform: translateY(-1px);
-            }
-            .btn-audit:active { transform: translateY(0); }
-
-            .btn-pdf {
-                background: #ffffff;
-                color: var(--primary);
-                border: 1.5px solid var(--primary-border);
-                font-size: 12.5px;
-                padding: 7px 14px;
-                border-radius: 8px;
-                cursor: pointer;
-                font-weight: 600;
-                transition: all 0.2s;
-            }
-            .btn-pdf:hover {
-                background: var(--primary-light);
-                border-color: var(--primary-accent);
-            }
-
-            /* Findings Overview Callout */
-            .overview-card {
-                background: #ffffff;
-                border: 1px solid var(--border);
-                border-radius: 16px;
-                padding: 18px 24px;
-                margin-bottom: 20px;
-                box-shadow: var(--shadow-sm);
-                display: flex;
-                align-items: center;
-                justify-content: space-between;
-                flex-wrap: wrap;
-                gap: 16px;
-            }
-            .overview-card.pass {
-                border-left: 5px solid var(--pass-text);
-                background: linear-gradient(90deg, var(--pass-bg) 0%, #ffffff 100%);
-            }
-            .overview-card.fail {
-                border-left: 5px solid var(--fail-text);
-                background: linear-gradient(90deg, var(--fail-bg) 0%, #ffffff 100%);
-            }
-            .status-title {
-                font-size: 15px;
-                font-weight: 700;
-                margin-bottom: 3px;
-            }
-            .status-desc {
-                font-size: 12px;
-                color: var(--text-muted);
-            }
-            .score-chip {
-                font-family: 'JetBrains Mono', monospace;
-                font-size: 18px;
-                font-weight: 700;
-                padding: 6px 16px;
-                border-radius: 30px;
-                background: #ffffff;
-                box-shadow: var(--shadow-sm);
-                border: 1px solid var(--border);
-            }
-
-            /* Clean Findings Table */
-            .table-wrap {
-                width: 100%;
-                overflow-x: auto;
-            }
-            table {
-                width: 100%;
-                border-collapse: separate;
-                border-spacing: 0;
-                font-size: 13px;
-                text-align: left;
-            }
-            th {
-                padding: 12px 16px;
-                font-size: 11px;
-                font-weight: 700;
-                text-transform: uppercase;
-                letter-spacing: 0.6px;
-                color: var(--text-muted);
-                background: var(--surface-subtle);
-                border-bottom: 1px solid var(--border);
-            }
-            th:first-child { border-top-left-radius: 10px; }
-            th:last-child { border-top-right-radius: 10px; }
-
-            td {
-                padding: 13px 16px;
-                border-bottom: 1px solid var(--border);
-                vertical-align: middle;
-                color: var(--text-main);
-            }
-            tr:last-child td { border-bottom: none; }
-            tr:hover td { background: #fafdfa; }
-
-            .pill {
-                display: inline-flex;
-                align-items: center;
-                gap: 5px;
-                padding: 3px 9px;
-                border-radius: 6px;
-                font-size: 11px;
-                font-weight: 700;
-                text-transform: uppercase;
-                letter-spacing: 0.3px;
-            }
-            .pill-pass {
-                background: var(--pass-bg);
-                color: var(--pass-text);
-                border: 1px solid var(--pass-border);
-            }
-            .pill-fail {
-                background: var(--fail-bg);
-                color: var(--fail-text);
-                border: 1px solid var(--fail-border);
-            }
-
-            .rule-badge {
-                font-family: 'JetBrains Mono', monospace;
-                font-size: 11.5px;
-                color: var(--primary);
-                font-weight: 600;
-                background: var(--surface-subtle);
-                padding: 2px 7px;
-                border-radius: 4px;
-            }
-
-            /* JSON Preview Panels */
-            pre {
-                font-family: 'JetBrains Mono', monospace;
-                font-size: 11.5px;
-                background: #fbfdfa;
-                border: 1px solid var(--border);
-                color: var(--text-main);
-                padding: 14px;
-                border-radius: 10px;
-                max-height: 180px;
-                overflow-x: auto;
-                line-height: 1.5;
-            }
-
-            .empty-view {
-                padding: 60px 20px;
-                text-align: center;
-                color: var(--text-muted);
-                font-size: 13.5px;
-            }
-        </style>
-    </head>
-    <body>
-
-        <!-- Navigation Bar -->
-        <header class="navbar">
-            <div class="navbar-inner">
-                <div class="brand-group">
-                    <div class="brand-icon">🌱</div>
-                    <span class="brand-title">Pramand_AI</span>
-                    <span class="brand-badge">PCR 2011 Metrology</span>
-                </div>
-                <div class="meta-pill">
-                    <div class="live-dot"></div>
-                    <span>Rules Engine v1.2 Active</span>
-                </div>
-            </div>
-        </header>
-
-        <div class="container">
-            
-            <!-- Tab Controls -->
-            <div class="tab-nav">
-                <button class="tab-btn active" onclick="switchTab('image')">Optical Image Scan</button>
-                <button class="tab-btn" onclick="switchTab('json')">Direct Data Simulator</button>
-            </div>
-
-            <div class="main-grid">
-                
-                <!-- Left Input Controls -->
-                <div class="card">
-                    
-                    <!-- Optical Mode -->
-                    <div id="imagePanel">
-                        <div class="card-header">
-                            <span class="card-title">Packaging Evidence</span>
-                        </div>
-                        <div class="card-body">
-                            <div class="dropzone">
-                                <span id="dropzoneText" style="font-size: 12px; color: var(--text-subtle);">No image selected</span>
-                                <img id="imagePreview" style="display: none;" />
-                            </div>
-
-                            <label for="imageInput" class="file-btn">
-                                <span>📁 Choose Label Photo</span>
-                            </label>
-                            <input type="file" id="imageInput" accept="image/*" onchange="previewLabelImage(event)">
-
-                            <div class="field-wrap">
-                                <label class="label">Packaging Geometry</label>
-                                <select id="shapeInput">
-                                    <option value="rectangular">Rectangular (Carton / Box / Pouch)</option>
-                                    <option value="cylindrical">Cylindrical (Bottle / Jar / Can)</option>
-                                </select>
-                            </div>
-
-                            <div class="grid-2 field-wrap">
-                                <div>
-                                    <label class="label">Height (cm)</label>
-                                    <input type="number" id="heightInput" value="15.0" step="0.1">
-                                </div>
-                                <div>
-                                    <label class="label">Width (cm)</label>
-                                    <input type="number" id="widthInput" value="10.0" step="0.1">
-                                </div>
-                            </div>
-
-                            <div class="field-wrap" style="margin-bottom: 20px;">
-                                <label class="label">Measured Font Height (mm)</label>
-                                <input type="number" id="fontInput" value="2.5" step="0.1">
-                            </div>
-
-                            <button class="btn-action btn-audit" onclick="runImageAudit()">
-                                🌿 Run Regulatory Verification
-                            </button>
-                        </div>
-                    </div>
-
-                    <!-- Direct JSON Mode -->
-                    <div id="jsonPanel" style="display: none;">
-                        <div class="card-header">
-                            <span class="card-title">OCR Line Stream</span>
-                        </div>
-                        <div class="card-body">
-                            <div class="field-wrap">
-                                <label class="label">OCR Detected Lines (JSON Array)</label>
-                                <textarea id="rawLinesInput" rows="10" style="font-family: 'JetBrains Mono', monospace; font-size: 11px;">[
-  "ORGANIC GREEN TEA",
-  "Net Qty: 200 g",
-  "MRP Rs. 149.00 (Incl. of all taxes)",
-  "USP: Rs. 0.745 / g",
-  "Mfg Date: 03/2026",
-  "Manufactured by: Pramand Organics Pvt Ltd, Pune 411001",
-  "Consumer Care: support@pramand.com, Toll Free 1800-111-2222",
-  "Country of Origin: India"
-]</textarea>
-                            </div>
-
-                            <div class="field-wrap" style="margin-bottom: 20px;">
-                                <label class="label">Font Height (mm)</label>
-                                <input type="number" id="jsonFontInput" value="2.8" step="0.1">
-                            </div>
-
-                            <button class="btn-action btn-audit" onclick="runJsonAudit()">
-                                🌿 Audit Data Array
-                            </button>
-                        </div>
-                    </div>
-
-                </div>
-
-                <!-- Right Findings Section -->
-                <div>
-                    <div id="emptyView" class="card empty-view">
-                        Select an image or payload on the left to review the compliance evaluation and export reports.
-                    </div>
-
-                    <div id="resultsDashboard" style="display: none;">
-                        
-                        <!-- Overview Status -->
-                        <div id="summaryCard" class="overview-card">
-                            <div>
-                                <div id="statusHeading" class="status-title"></div>
-                                <div class="status-desc">Assessment under Legal Metrology (Packaged Commodities) Rules, 2011</div>
-                            </div>
-                            <div id="scoreDisplay" class="score-chip"></div>
-                        </div>
-
-                        <!-- Findings Table Card -->
-                        <div class="card" style="margin-bottom: 20px;">
-                            <div class="card-header">
-                                <span class="card-title">Statutory Rule Findings</span>
-                                <button class="btn-pdf" onclick="downloadNoticePdf()">📄 Export Official Notice (PDF)</button>
-                            </div>
-
-                            <div class="table-wrap">
-                                <table>
-                                    <thead>
-                                        <tr>
-                                            <th style="width: 26%;">Mandatory Field</th>
-                                            <th style="width: 18%;">Rule Cited</th>
-                                            <th style="width: 14%;">Status</th>
-                                            <th style="width: 42%;">Inspector Findings</th>
-                                        </tr>
-                                    </thead>
-                                    <tbody id="findingsTableBody"></tbody>
-                                </table>
-                            </div>
-                        </div>
-
-                        <!-- Extraction Details -->
-                        <div class="grid-2">
-                            <div class="card">
-                                <div class="card-header">
-                                    <span class="card-title">Parsed Legal Entities</span>
-                                </div>
-                                <div class="card-body" style="padding: 12px;">
-                                    <pre id="parsedEntitiesBlock"></pre>
-                                </div>
-                            </div>
-                            <div class="card">
-                                <div class="card-header">
-                                    <span class="card-title">Raw Text Stream</span>
-                                </div>
-                                <div class="card-body" style="padding: 12px;">
-                                    <pre id="rawOcrBlock"></pre>
-                                </div>
-                            </div>
-                        </div>
-
-                    </div>
-                </div>
-
-            </div>
-        </div>
-
-        <script>
-            let activeAuditPayload = null;
-
-            function switchTab(mode) {
-                const buttons = document.querySelectorAll('.tab-btn');
-                buttons.forEach(b => b.classList.remove('active'));
-                
-                if (mode === 'image') {
-                    buttons[0].classList.add('active');
-                    document.getElementById('imagePanel').style.display = 'block';
-                    document.getElementById('jsonPanel').style.display = 'none';
-                } else {
-                    buttons[1].classList.add('active');
-                    document.getElementById('imagePanel').style.display = 'none';
-                    document.getElementById('jsonPanel').style.display = 'block';
-                }
-            }
-
-            function previewLabelImage(e) {
-                const file = e.target.files[0];
-                if (file) {
-                    const reader = new FileReader();
-                    reader.onload = function(evt) {
-                        const img = document.getElementById('imagePreview');
-                        img.src = evt.target.result;
-                        img.style.display = 'block';
-                        document.getElementById('dropzoneText').style.display = 'none';
-                    };
-                    reader.readAsDataURL(file);
-                }
-            }
-
-            function renderComplianceDashboard(data, fontHeight, metadata, rawLines) {
-                document.getElementById('emptyView').style.display = 'none';
-                document.getElementById('resultsDashboard').style.display = 'block';
-
-                const report = data.compliance_report;
-                const summaryCard = document.getElementById('summaryCard');
-                const statusHeading = document.getElementById('statusHeading');
-                const scoreDisplay = document.getElementById('scoreDisplay');
-
-                if (report.compliant) {
-                    summaryCard.className = 'overview-card pass';
-                    statusHeading.innerHTML = '✅ Fully Compliant';
-                    statusHeading.style.color = 'var(--pass-text)';
-                    scoreDisplay.style.color = 'var(--pass-text)';
-                } else {
-                    summaryCard.className = 'overview-card fail';
-                    statusHeading.innerHTML = '⚠️ Non-Compliance Detected';
-                    statusHeading.style.color = 'var(--fail-text)';
-                    scoreDisplay.style.color = 'var(--fail-text)';
-                }
-
-                scoreDisplay.innerText = `${report.score} (${report.percentage}%)`;
-
-                const tbody = document.getElementById('findingsTableBody');
-                tbody.innerHTML = '';
-                report.results.forEach(r => {
-                    const pillClass = r.pass ? 'pill-pass' : 'pill-fail';
-                    const pillText = r.pass ? 'PASS' : 'FAIL';
-                    tbody.innerHTML += `
-                        <tr>
-                            <td><strong>${r.field}</strong></td>
-                            <td><span class="rule-badge">${r.rule}</span></td>
-                            <td><span class="pill ${pillClass}">${pillText}</span></td>
-                            <td>${r.reason}</td>
-                        </tr>
-                    `;
-                });
-
-                document.getElementById('parsedEntitiesBlock').innerText = JSON.stringify(data.parsed_fields, null, 2);
-                document.getElementById('rawOcrBlock').innerText = JSON.stringify(data.ocr_detected_lines || rawLines, null, 2);
-
-                activeAuditPayload = {
-                    raw_ocr_lines: data.ocr_detected_lines || rawLines,
-                    font_height_mm: fontHeight,
-                    metadata: metadata
-                };
-            }
-
-            async function runImageAudit() {
-                const fileInput = document.getElementById('imageInput');
-                if (!fileInput.files[0]) {
-                    alert("Please select a packaging label photo first.");
-                    return;
-                }
-
-                const fontHeight = parseFloat(document.getElementById('fontInput').value);
-                const metadata = {
-                    shape: document.getElementById('shapeInput').value,
-                    height_cm: parseFloat(document.getElementById('heightInput').value),
-                    width_cm: parseFloat(document.getElementById('widthInput').value),
-                    circumference_cm: 0.0,
-                    total_surface_area_cm2: 0.0,
-                    is_blown: false
-                };
-
-                const formData = new FormData();
-                formData.append('file', fileInput.files[0]);
-                formData.append('shape', metadata.shape);
-                formData.append('height_cm', metadata.height_cm);
-                formData.append('width_cm', metadata.width_cm);
-                formData.append('font_height_mm', fontHeight);
-
-                try {
-                    const res = await fetch('/api/scan-image', { method: 'POST', body: formData });
-                    const data = await res.json();
-                    renderComplianceDashboard(data, fontHeight, metadata, data.ocr_detected_lines);
-                } catch (err) {
-                    alert("Audit execution failed: " + err.message);
-                }
-            }
-
-            async function runJsonAudit() {
-                try {
-                    const rawLines = JSON.parse(document.getElementById('rawLinesInput').value);
-                    const fontHeight = parseFloat(document.getElementById('jsonFontInput').value);
-                    const metadata = { shape: "rectangular", height_cm: 15.0, width_cm: 10.0, is_blown: false };
-
-                    const res = await fetch('/api/audit', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({
-                            raw_ocr_lines: rawLines,
-                            font_height_mm: fontHeight,
-                            metadata: metadata
-                        })
-                    });
-                    const data = await res.json();
-                    renderComplianceDashboard(data, fontHeight, metadata, rawLines);
-                } catch (err) {
-                    alert("Invalid JSON format or server error: " + err.message);
-                }
-            }
-
-            async function downloadNoticePdf() {
-                if (!activeAuditPayload) return;
-
-                const res = await fetch('/api/audit/pdf', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(activeAuditPayload)
-                });
-
-                const blob = await res.blob();
-                const url = window.URL.createObjectURL(blob);
-                const a = document.createElement('a');
-                a.href = url;
-                a.download = "Pramand_AI_Inspection_Notice.pdf";
-                document.body.appendChild(a);
-                a.click();
-                a.remove();
-            }
-        </script>
-    </body>
-    </html>
-    """
+    return FileResponse(
+        path=output_pdf_path,
+        media_type="application/pdf",
+        filename="Pramand_AI_Inspection_Notice.pdf"
+    )

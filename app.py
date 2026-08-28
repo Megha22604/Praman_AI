@@ -8,7 +8,7 @@ from rules_engine import evaluate_all_rules
 from report_generator import generate_pdf_report
 
 app = FastAPI(
-    title="Pramand_AI Compliance Engine",
+    title="PramanAI Compliance Engine",
     description="Automated Legal Metrology (Packaged Commodities) Rules, 2011 Verification Engine",
     version="1.0.0"
 )

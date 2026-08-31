@@ -76,13 +76,17 @@ def generate_pdf_report(compliance_data, output_path="inspection_report.pdf"):
 
     report = compliance_data.get("compliance_report", {})
     is_compliant = report.get("compliant", False)
+    status = report.get("status", "PASS" if is_compliant else "FAIL")
     score_text = sanitize_text(report.get("score", "N/A"))
 
     # Status Banner
     pdf.set_font("Helvetica", "B", 10)
-    if is_compliant:
+    if status == "PASS":
         pdf.set_text_color(22, 101, 52)
         pdf.cell(0, 6, f"Overall Status: FULLY COMPLIANT ({score_text})")
+    elif status == "NEEDS REVIEW":
+        pdf.set_text_color(217, 119, 6)
+        pdf.cell(0, 6, f"Overall Status: MANUAL REVIEW REQUIRED ({score_text})")
     else:
         pdf.set_text_color(185, 28, 28)
         pdf.cell(0, 6, f"Overall Status: NON-COMPLIANCE DETECTED ({score_text})")
@@ -95,29 +99,31 @@ def generate_pdf_report(compliance_data, output_path="inspection_report.pdf"):
     pdf.set_fill_color(240, 244, 240)
     pdf.cell(40, 6, "Field", border=1, fill=True)
     pdf.cell(26, 6, "Rule Cited", border=1, fill=True)
-    pdf.cell(18, 6, "Status", border=1, fill=True)
-    pdf.cell(106, 6, "Finding / Reason", border=1, fill=True)
+    pdf.cell(26, 6, "Status", border=1, fill=True)
+    pdf.cell(98, 6, "Finding / Reason", border=1, fill=True)
     pdf.ln(6)
 
     # 3. Table Rows
     pdf.set_font("Helvetica", "", 8)
     for row in report.get("results", []):
-        status_text = "PASS" if row["pass"] else "FAIL"
+        row_status = row.get("status", "PASS" if row.get("pass") else "FAIL")
 
         pdf.cell(40, 6, sanitize_text(row.get("field", "")), border=1)
         pdf.cell(26, 6, sanitize_text(row.get("rule", "")), border=1)
 
         # Status text color
-        if row["pass"]:
+        if row_status == "PASS":
             pdf.set_text_color(22, 101, 52)
+        elif row_status == "NEEDS REVIEW":
+            pdf.set_text_color(217, 119, 6)
         else:
             pdf.set_text_color(185, 28, 28)
-        pdf.cell(18, 6, status_text, border=1)
+        pdf.cell(26, 6, row_status, border=1)
 
         pdf.set_text_color(0, 0, 0)
         raw_reason = sanitize_text(str(row.get("reason", "")))
-        clean_reason = (raw_reason[:68] + "..") if len(raw_reason) > 70 else raw_reason
-        pdf.cell(106, 6, clean_reason, border=1)
+        clean_reason = (raw_reason[:62] + "..") if len(raw_reason) > 65 else raw_reason
+        pdf.cell(98, 6, clean_reason, border=1)
         pdf.ln(6)
 
     # 4. Statutory Rules Annexure (Word-by-Word Reference)

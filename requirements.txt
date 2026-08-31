@@ -4,3 +4,5 @@ python-multipart
 pytesseract
 Pillow
 fpdf2
+opencv-contrib-python-headless
+numpy

@@ -152,8 +152,8 @@ def validate_unit_sale_price(usp_text, mrp_text=None, qty_text=None):
         }
 
     text = str(usp_text).lower()
-    # Check for unit pricing pattern (e.g., '0.09/g', 'rs. 2 per ml', '10 / piece')
-    pattern = r"(\d+(?:\.\d+)?)\s*(?:\/|per)\s*(g|gm|kg|ml|l|ltr|pcs|piece|unit|u|n)"
+    # Check for unit pricing pattern (e.g., '0.09/g', 'rs. 0.26/- per g', 'rs. 2 per ml', '10 / piece')
+    pattern = r"(\d+(?:\.\d+)?)\s*(?:\/-)?\s*(?:\/|per|\/per)\s*(g|gm|kg|ml|l|ltr|pcs|piece|pieces|unit|units|u|n)\b"
     match = re.search(pattern, text)
 
     if not match:
@@ -170,6 +170,7 @@ def validate_unit_sale_price(usp_text, mrp_text=None, qty_text=None):
         "rule": "Rule 6(11)",
         "reason": "OK"
     }
+
 def calculate_pdp_area(shape="rectangular", height_cm=0, width_cm=0, circumference_cm=0, total_surface_area_cm2=0):
     """Calculates Principal Display Panel (PDP) area in cm² according to Rule 7(5)."""
     shape = str(shape).lower()
@@ -234,6 +235,8 @@ def validate_label(extracted_data):
 
     # Rule 7 Spatial / Font Size Check (runs if dimensions are provided)
     meta = extracted_data.get("metadata", {})
+    calibration_error = extracted_data.get("dimension_calibration_error")
+
     if meta:
         pdp_area = calculate_pdp_area(
             shape=meta.get("shape", "rectangular"),
@@ -248,6 +251,13 @@ def validate_label(extracted_data):
             is_blown=meta.get("is_blown", False)
         )
         results.append(font_check)
+    elif calibration_error:
+        results.append({
+            "field": "PDP Font Height",
+            "pass": False,
+            "rule": "Rule 7(2)",
+            "reason": calibration_error
+        })
 
     all_passed = all(r["pass"] for r in results)
     passed_count = sum(1 for r in results if r["pass"])
@@ -260,7 +270,13 @@ def validate_label(extracted_data):
         "results": results
     }
 
-def evaluate_all_rules(raw_lines: list[str], package_height_cm: float = 15.0, package_width_cm: float = 10.0, detected_font_height_mm: float = 2.5) -> dict:
+def evaluate_all_rules(
+    raw_lines: list[str],
+    package_height_cm: float | None = None,
+    package_width_cm: float | None = None,
+    detected_font_height_mm: float = 2.5,
+    dimension_calibration_error: str | None = None
+) -> dict:
     """
     Adapter function that converts OCR raw lines into structured fields
     and executes validate_label().
@@ -277,23 +293,32 @@ def evaluate_all_rules(raw_lines: list[str], package_height_cm: float = 15.0, pa
         "consumer_care": None,
         "country_of_origin": None,
         "unit_sale_price": None,
-        "font_height_mm": float(detected_font_height_mm),
-        "metadata": {
+        "font_height_mm": float(detected_font_height_mm) if detected_font_height_mm is not None else None,
+    }
+
+    if package_height_cm is not None and package_width_cm is not None:
+        extracted_data["metadata"] = {
             "shape": "rectangular",
             "height_cm": float(package_height_cm),
             "width_cm": float(package_width_cm),
             "is_blown": False
         }
-    }
+    else:
+        extracted_data["dimension_calibration_error"] = (
+            dimension_calibration_error or "Package dimensions were not calibrated."
+        )
+
 
     # 1. MRP & Currency Match
-    mrp_match = re.search(r"(?:mrp|max(?:imum)?\s*retail\s*price)[:\s]*(?:rs\.?|₹|inr)?\s*(\d+(?:\.\d+)?)", lower_text)
-    if mrp_match or "mrp" in lower_text or "₹" in full_text or "rs." in lower_text:
-        extracted_data["mrp"] = mrp_match.group(0) if mrp_match else "MRP detected"
+    mrp_match = re.search(r"(?:mrp|max(?:imum)?\s*retail\s*price|incl(?:usive)?\.?\s*of\s*all\s*taxes)[:\s]*(?:rs\.?|₹|inr)?\s*(\d+(?:\.\d+)?)", lower_text)
+    if not mrp_match:
+        mrp_match = re.search(r"(?:rs\.?|₹|inr)\s*(\d+(?:\.\d+)?)\s*(?:\/-)?\s*(?:\(|\[)?\s*(?:incl|max|mrp)", lower_text)
+    if mrp_match or "mrp" in lower_text or "₹" in full_text or "rs." in lower_text or "incl. of all taxes" in lower_text:
+        extracted_data["mrp"] = mrp_match.group(0) if mrp_match else "MRP: Rs. declared (incl. of all taxes)"
 
     # 2. Manufacturer Details Match
-    mfg_match = re.search(r"(?:mfd|manufactured|packed|marketed|imported)\s*by[:\s]*([^,\n]+(?:,[^,\n]+)*)", lower_text)
-    if mfg_match or any(k in lower_text for k in ["mfd by", "manufactured by", "packed by", "marketed by"]):
+    mfg_match = re.search(r"(?:mfd|manufactured|packed|marketed|imported)\s*(?:by|in|pvt|ltd|llp)?[:\s]*([^,\n]+(?:,[^,\n]+)*)", lower_text)
+    if mfg_match or any(k in lower_text for k in ["mfd by", "manufactured by", "packed by", "marketed by", "pepsico", "pvt. ltd", "pvt ltd", "ltd.", "llp"]):
         extracted_data["manufacturer"] = mfg_match.group(0) if mfg_match else "Manufacturer declared"
 
     # 3. Net Quantity Match
@@ -302,14 +327,14 @@ def evaluate_all_rules(raw_lines: list[str], package_height_cm: float = 15.0, pa
         extracted_data["net_quantity"] = qty_match.group(0)
 
     # 4. Date of Manufacture Match
-    date_match = re.search(r"(?:mfd|mfg|packed|pkd|date)[:\s]*([0-1]?[0-9][/-](?:20)?[2-3][0-9]|[a-z]{3}[/-]?(?:20)?[2-3][0-9])", lower_text)
-    if date_match or any(k in lower_text for k in ["mfd", "mfg", "pkd", "packed"]):
+    date_match = re.search(r"(?:mfd|mfg|packed|pkd|use\s*by|date|b\.no\.?)[:\s]*([0-3]?[0-9][/-][0-1]?[0-9][/-](?:20)?[2-3][0-9]|[0-1]?[0-9][/-](?:20)?[2-3][0-9]|[a-z]{3}[/-]?(?:20)?[2-3][0-9])", lower_text)
+    if date_match or any(k in lower_text for k in ["mfd", "mfg", "pkd", "packed", "use by"]):
         extracted_data["mfg_date"] = date_match.group(0) if date_match else "Date declared"
 
     # 5. Consumer Care Match
-    phone_match = re.search(r"\b(?:\+91|0)?[6-9]\d{9}\b|\b1800[- ]?\d{3}[- ]?\d{3,4}\b", full_text)
+    phone_match = re.search(r"\b(?:\+91|0)?[6-9]\d{9}\b|\b1800[- ]?\d{2,4}[- ]?\d{3,4}\b", full_text)
     email_match = re.search(r"[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}", lower_text)
-    if phone_match or email_match or any(k in lower_text for k in ["customer care", "helpline", "toll free", "feedback"]):
+    if phone_match or email_match or any(k in lower_text for k in ["customer care", "helpline", "toll free", "feedback", "call us"]):
         extracted_data["consumer_care"] = (email_match.group(0) if email_match else None) or (phone_match.group(0) if phone_match else "Helpline declared")
 
     # 6. Country of Origin Match
@@ -318,8 +343,13 @@ def evaluate_all_rules(raw_lines: list[str], package_height_cm: float = 15.0, pa
         extracted_data["country_of_origin"] = origin_match.group(0) if origin_match else "India"
 
     # 7. Unit Sale Price Match
-    usp_match = re.search(r"(?:usp|unit\s*sale\s*price|rate)[:\s]*(?:rs\.?|inr|₹)?\s*(\d+(?:\.\d+)?)\s*(?:\/|per)\s*(?:g|kg|ml|l|pcs|piece|unit)", lower_text)
+    usp_pattern = r"(?:(?:usp|unit\s*sale\s*price|sale\s*price|unit\s*price|\brate\b)[:\s\S]{0,40})?(?:rs\.?|inr|₹)?\s*(\d+(?:\.\d+)?)\s*(?:\/-)?\s*(?:\/|per|\/per)\s*(?:g|gm|kg|ml|l|ltr|pcs|piece|unit|u|n)\b"
+    usp_match = re.search(usp_pattern, lower_text)
     if usp_match:
         extracted_data["unit_sale_price"] = usp_match.group(0)
+    elif any(k in lower_text for k in ["usp", "unit sale price", "sale price"]):
+        extracted_data["unit_sale_price"] = "Unit Sale Price declared"
+
+
 
     return validate_label(extracted_data)

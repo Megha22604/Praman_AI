@@ -1,11 +1,12 @@
 import io
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
-from fastapi.responses import HTMLResponse, FileResponse
+from fastapi.responses import HTMLResponse, FileResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 
 from ocr_engine import extract_text_lines_from_image
 from rules_engine import evaluate_all_rules
 from report_generator import generate_pdf_report
+from calibration import generate_marker_png_bytes, calibrate_package_dimensions
 
 app = FastAPI(
     title="PramanAI Compliance Engine",
@@ -111,27 +112,25 @@ UI_HTML = """
                             </button>
                         </div>
 
-                        <!-- Physical Dimensions Card -->
+                        <!-- Automatic Physical Calibration & Font Height Card -->
                         <div class="bg-slate-900/50 border border-slate-700/60 rounded-xl p-3.5 space-y-3">
-                            <p class="text-xs font-semibold text-slate-300 flex items-center gap-1.5">
-                                <i class="fa-solid fa-ruler-combined text-blue-400"></i> Dimensions & Font (Optional)
+                            <div class="flex items-center justify-between">
+                                <p class="text-xs font-semibold text-slate-300 flex items-center gap-1.5">
+                                    <i class="fa-solid fa-qrcode text-blue-400"></i> Physical Dimension Calibration
+                                </p>
+                                <a href="/api/calibration-marker" target="_blank"
+                                    class="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-[11px] font-medium bg-blue-600/20 text-blue-400 hover:bg-blue-600/30 border border-blue-500/30 transition">
+                                    <i class="fa-solid fa-print text-xs"></i>
+                                    <span>Get Marker</span>
+                                </a>
+                            </div>
+                            <p class="text-[11px] text-slate-400 leading-relaxed">
+                                Package height & width are measured automatically. Print the calibration marker and place it flat next to the product, fully visible, before photographing.
                             </p>
-                            <div class="grid grid-cols-2 gap-2.5">
-                                <div>
-                                    <label class="block text-[11px] text-slate-400 mb-1">Height (cm)</label>
-                                    <input type="number" step="0.1" id="pkg_height" value="15.0"
-                                        class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-1.5 text-xs text-white focus:outline-none focus:border-blue-500">
-                                </div>
-                                <div>
-                                    <label class="block text-[11px] text-slate-400 mb-1">Width (cm)</label>
-                                    <input type="number" step="0.1" id="pkg_width" value="10.0"
-                                        class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-1.5 text-xs text-white focus:outline-none focus:border-blue-500">
-                                </div>
-                                <div class="col-span-2">
-                                    <label class="block text-[11px] text-slate-400 mb-1">Detected Font Height (mm)</label>
-                                    <input type="number" step="0.1" id="font_height" value="2.5"
-                                        class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-1.5 text-xs text-white focus:outline-none focus:border-blue-500">
-                                </div>
+                            <div>
+                                <label class="block text-[11px] text-slate-400 mb-1">Detected Font Height (mm)</label>
+                                <input type="number" step="0.1" id="font_height" value="2.5"
+                                    class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-1.5 text-xs text-white focus:outline-none focus:border-blue-500">
                             </div>
                         </div>
 
@@ -169,6 +168,17 @@ UI_HTML = """
                 <!-- Live Results View -->
                 <div id="resultsCard" class="hidden space-y-4">
                     
+                    <!-- Calibration Status Card -->
+                    <div id="calibrationCard" class="hidden rounded-xl p-3.5 flex items-center justify-between text-xs border shadow-md">
+                        <div class="flex items-center gap-3">
+                            <span id="calibrationIcon"></span>
+                            <div>
+                                <p id="calibrationTitle" class="font-semibold text-xs"></p>
+                                <p id="calibrationSubtitle" class="text-[11px] opacity-90"></p>
+                            </div>
+                        </div>
+                    </div>
+
                     <!-- Score Banner -->
                     <div id="statusBanner" class="rounded-2xl p-4 sm:p-5 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 shadow-lg border">
                         <div class="space-y-0.5">
@@ -267,8 +277,6 @@ UI_HTML = """
 
             const formData = new FormData();
             formData.append('file', fileInput.files[0]);
-            formData.append('package_height_cm', document.getElementById('pkg_height').value || 15.0);
-            formData.append('package_width_cm', document.getElementById('pkg_width').value || 10.0);
             formData.append('detected_font_height_mm', document.getElementById('font_height').value || 2.5);
 
             // Toggle States
@@ -302,6 +310,30 @@ UI_HTML = """
         function renderResults(data) {
             const report = data.compliance_report;
             const isCompliant = report.compliant;
+
+            // Calibration Status Card
+            const cal = data.dimension_calibration;
+            const calCard = document.getElementById('calibrationCard');
+            const calIcon = document.getElementById('calibrationIcon');
+            const calTitle = document.getElementById('calibrationTitle');
+            const calSubtitle = document.getElementById('calibrationSubtitle');
+
+            if (cal) {
+                calCard.classList.remove('hidden');
+                if (cal.success) {
+                    calCard.className = 'rounded-xl p-3.5 flex items-center justify-between text-xs border bg-emerald-950/40 border-emerald-500/30 text-emerald-300';
+                    calIcon.innerHTML = '<i class="fa-solid fa-ruler-combined text-emerald-400 text-lg"></i>';
+                    calTitle.innerText = `Calibrated via marker ID ${cal.marker_id}: ${cal.height_cm}cm × ${cal.width_cm}cm detected automatically`;
+                    calSubtitle.innerText = `Scale ratio: ${cal.pixels_per_mm} px/mm`;
+                } else {
+                    calCard.className = 'rounded-xl p-3.5 flex items-center justify-between text-xs border bg-amber-950/40 border-amber-500/30 text-amber-300';
+                    calIcon.innerHTML = '<i class="fa-solid fa-triangle-exclamation text-amber-400 text-lg"></i>';
+                    calTitle.innerText = 'Dimension Calibration Required';
+                    calSubtitle.innerText = cal.message;
+                }
+            } else {
+                calCard.classList.add('hidden');
+            }
 
             // Status Banner
             const banner = document.getElementById('statusBanner');
@@ -365,21 +397,21 @@ UI_HTML = """
 </html>
 """
 
+@app.get("/", response_class=HTMLResponse)
 @app.get("/ui", response_class=HTMLResponse)
 def get_user_interface():
     """Serves the responsive, mobile-first inspector UI."""
     return HTMLResponse(content=UI_HTML)
 
+
 @app.post("/api/scan-image")
 async def scan_package_image(
     file: UploadFile = File(...),
-    package_height_cm: float = Form(15.0),
-    package_width_cm: float = Form(10.0),
     detected_font_height_mm: float = Form(2.5)
 ):
     """
-    Ingests label image bytes, extracts OCR tokens, runs LMPC validation,
-    and caches the latest report for PDF export.
+    Ingests label image bytes, extracts OCR tokens, calibrates physical package dimensions,
+    runs LMPC validation, and caches the latest report for PDF export.
     """
     global latest_report_cache
     
@@ -387,19 +419,30 @@ async def scan_package_image(
         raise HTTPException(status_code=400, detail="Uploaded file must be a valid image (PNG/JPG).")
 
     image_bytes = await file.read()
+    
+    # 1. Automatic physical dimension calibration via ArUco reference marker
+    calibration = calibrate_package_dimensions(image_bytes)
+    pkg_h = calibration.get("height_cm") if calibration.get("success") else None
+    pkg_w = calibration.get("width_cm") if calibration.get("success") else None
+    cal_err = calibration.get("message") if not calibration.get("success") else None
+
+    # 2. OCR text line extraction
     raw_lines = extract_text_lines_from_image(image_bytes)
 
+    # 3. LMPC statutory rules evaluation
     compliance_results = evaluate_all_rules(
         raw_lines=raw_lines,
-        package_height_cm=package_height_cm,
-        package_width_cm=package_width_cm,
-        detected_font_height_mm=detected_font_height_mm
+        package_height_cm=pkg_h,
+        package_width_cm=pkg_w,
+        detected_font_height_mm=detected_font_height_mm,
+        dimension_calibration_error=cal_err
     )
 
     response_payload = {
         "status": "success",
         "detected_raw_lines": raw_lines,
-        "compliance_report": compliance_results
+        "compliance_report": compliance_results,
+        "dimension_calibration": calibration
     }
 
     # Store for PDF generator
@@ -422,3 +465,10 @@ def export_official_notice_pdf():
         media_type="application/pdf",
         filename="PramanAI_Inspection_Notice.pdf"
     )
+
+@app.get("/api/calibration-marker")
+def get_calibration_marker():
+    """Returns the printable ArUco calibration marker as a PNG image."""
+    png_bytes = generate_marker_png_bytes()
+    return Response(content=png_bytes, media_type="image/png")
+

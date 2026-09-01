@@ -128,3 +128,58 @@ def create_image(
         cur.execute(query, (scan_id, image_url, image_type))
         image_id = cur.fetchone()[0]
         return image_id
+
+
+def get_scan_results_for_scan(conn, scan_id):
+    """
+    Fetches all scan_results records for a given scan_id ordered by result_id ASC.
+    Returns a list of dictionaries.
+    """
+    with conn.cursor() as cur:
+        query = """
+        SELECT
+            result_id,
+            scan_id,
+            rule_code,
+            status,
+            finding_detail,
+            created_at
+        FROM scan_results
+        WHERE scan_id = %s
+        ORDER BY result_id ASC;
+        """
+        cur.execute(query, (scan_id,))
+        rows = cur.fetchall()
+        if not rows:
+            return []
+        if isinstance(rows[0], dict):
+            return rows
+        columns = [desc[0] for desc in cur.description]
+        return [dict(zip(columns, row)) for row in rows]
+
+
+def get_images_for_scan(conn, scan_id):
+    """
+    Fetches all images records for a given scan_id ordered by image_id ASC.
+    Returns a list of dictionaries.
+    """
+    with conn.cursor() as cur:
+        query = """
+        SELECT
+            image_id,
+            scan_id,
+            image_url,
+            image_type,
+            created_at
+        FROM images
+        WHERE scan_id = %s
+        ORDER BY image_id ASC;
+        """
+        cur.execute(query, (scan_id,))
+        rows = cur.fetchall()
+        if not rows:
+            return []
+        if isinstance(rows[0], dict):
+            return rows
+        columns = [desc[0] for desc in cur.description]
+        return [dict(zip(columns, row)) for row in rows]

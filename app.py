@@ -7,7 +7,7 @@ from ocr_engine import extract_text_lines_from_image
 from rules_engine import evaluate_all_rules
 from report_generator import generate_pdf_report
 from database import get_connection
-from crud import create_scan, create_scan_result, create_image
+from crud import create_scan, create_scan_result, create_image, get_scan, get_scan_results_for_scan, get_images_for_scan
 from storage import upload_image, delete_image
 
 app = FastAPI(
@@ -674,6 +674,81 @@ async def scan_package_images(
 
     latest_report_cache = response_payload
     return response_payload
+
+@app.get("/api/scans/{scan_id}")
+def get_scan_by_id(scan_id: int):
+    """
+    Retrieves a persisted scan record, its associated scan_results,
+    and image references by scan_id from PostgreSQL.
+    Independent of in-memory latest_report_cache.
+    """
+    conn = None
+    try:
+        conn = get_connection()
+        scan_record = get_scan(conn, scan_id)
+        if not scan_record:
+            raise HTTPException(status_code=404, detail="Scan not found")
+
+        results_records = get_scan_results_for_scan(conn, scan_id)
+        images_records = get_images_for_scan(conn, scan_id)
+
+        # Parse ocr_raw_text cleanly
+        ocr_data = scan_record.get("ocr_raw_text")
+        raw_lines = []
+        if ocr_data is not None:
+            if isinstance(ocr_data, list):
+                raw_lines = ocr_data
+            elif isinstance(ocr_data, str):
+                import json
+                try:
+                    raw_lines = json.loads(ocr_data)
+                except Exception:
+                    raw_lines = [ocr_data]
+
+        font_height = scan_record.get("font_height_detected")
+        if font_height is not None:
+            font_height = float(font_height)
+
+        response_payload = {
+            "scan_id": scan_record["scan_id"],
+            "timestamp": scan_record["timestamp"],
+            "overall_verdict": scan_record["overall_verdict"],
+            "font_height_detected": font_height,
+            "ocr": {
+                "raw_lines": raw_lines
+            },
+            "results": [
+                {
+                    "result_id": r["result_id"],
+                    "rule_code": r["rule_code"],
+                    "status": r["status"],
+                    "finding_detail": r["finding_detail"],
+                    "created_at": r["created_at"]
+                }
+                for r in results_records
+            ],
+            "images": [
+                {
+                    "image_id": img["image_id"],
+                    "image_url": img["image_url"],
+                    "image_type": img["image_type"],
+                    "created_at": img["created_at"]
+                }
+                for img in images_records
+            ],
+            "product_id": scan_record.get("product_id"),
+            "user_id": scan_record.get("user_id"),
+            "org": scan_record.get("org")
+        }
+
+        return response_payload
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve scan record: {str(e)}")
+    finally:
+        if conn:
+            conn.close()
 
 @app.get("/api/export-pdf")
 def export_official_notice_pdf():

@@ -7,7 +7,11 @@ from ocr_engine import extract_text_lines_from_image
 from rules_engine import evaluate_all_rules
 from report_generator import generate_pdf_report
 from database import get_connection
-from crud import create_scan, create_scan_result, create_image, get_scan, get_scan_results_for_scan, get_images_for_scan, get_paginated_scans
+from crud import (
+    create_scan, create_scan_result, create_image,
+    get_scan, get_scan_results_for_scan, get_images_for_scan,
+    get_paginated_scans, get_product, get_paginated_scans_for_product
+)
 from storage import upload_image, delete_image
 
 app = FastAPI(
@@ -877,6 +881,88 @@ def get_scan_by_id(scan_id: int):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to retrieve scan record: {str(e)}")
+    finally:
+        if conn:
+            conn.close()
+
+@app.get("/api/products/{product_id}/history")
+def get_product_history(
+    product_id: int,
+    page: int = Query(1),
+    page_size: int = Query(10)
+):
+    """
+    Retrieves historical scan records associated with a specific product_id from PostgreSQL.
+    Returns HTTP 404 if the product_id does not exist.
+    """
+    MAX_PAGE_SIZE = 100
+
+    if page < 1:
+        raise HTTPException(status_code=400, detail="page must be greater than or equal to 1.")
+
+    if page_size < 1:
+        raise HTTPException(status_code=400, detail="page_size must be greater than or equal to 1.")
+
+    if page_size > MAX_PAGE_SIZE:
+        raise HTTPException(status_code=400, detail=f"page_size cannot exceed maximum allowed limit of {MAX_PAGE_SIZE}.")
+
+    conn = None
+    try:
+        conn = get_connection()
+
+        # 1. Product existence check
+        product_record = get_product(conn, product_id)
+        if not product_record:
+            raise HTTPException(status_code=404, detail="Product not found")
+
+        # 2. Paginated scan fetch for product
+        res_data = get_paginated_scans_for_product(conn, product_id, page=page, page_size=page_size)
+
+        formatted_items = []
+        for item in res_data.get("items", []):
+            ocr_data = item.get("ocr_raw_text")
+            raw_lines = []
+            if ocr_data is not None:
+                if isinstance(ocr_data, list):
+                    raw_lines = ocr_data
+                elif isinstance(ocr_data, str):
+                    import json
+                    try:
+                        raw_lines = json.loads(ocr_data)
+                    except Exception:
+                        raw_lines = [ocr_data]
+
+            font_height = item.get("font_height_detected")
+            if font_height is not None:
+                font_height = float(font_height)
+
+            formatted_items.append({
+                "scan_id": item["scan_id"],
+                "timestamp": item["timestamp"],
+                "overall_verdict": item["overall_verdict"],
+                "font_height_detected": font_height,
+                "ocr": {
+                    "raw_lines": raw_lines
+                },
+                "user_id": item.get("user_id"),
+                "org": item.get("org")
+            })
+
+        return {
+            "product_id": product_record["product_id"],
+            "product_name": product_record.get("name"),
+            "brand": product_record.get("brand"),
+            "category": product_record.get("category"),
+            "items": formatted_items,
+            "page": res_data["page"],
+            "page_size": res_data["page_size"],
+            "total": res_data["total"],
+            "total_pages": res_data["total_pages"]
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve product scan history: {str(e)}")
     finally:
         if conn:
             conn.close()

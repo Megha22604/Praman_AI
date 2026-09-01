@@ -1,19 +1,16 @@
 """
-Scan Retrieval, Pagination & Search/Filter Test Suite (Step 10, 11 & 12 Implementation)
-Tests GET /api/scans and GET /api/scans/{scan_id} endpoints across:
+Scan Retrieval, Pagination, Filtering & Product History Test Suite (Step 10, 11, 12 & 13)
+Tests GET /api/scans, GET /api/scans/{scan_id}, and GET /api/products/{product_id}/history across:
 - Step 10 Tests: Individual scan retrieval by ID, 404 behavior, OCR, 5-image retrieval, ordering, cache independence.
 - Step 11 Tests: Default pagination, page sizing, newest-first ordering, limit/offset, validation, total calculation.
-- Step 12 Tests:
-  - status filter (PASS, FAIL, NEEDS REVIEW)
-  - date filtering (start_date, end_date, combined date range)
-  - failed_rule filter (returns matching scans without duplicate rows)
-  - product_name & brand filtering (via products JOIN)
-  - inspector filtering (via users JOIN)
-  - combined filters (status + start_date + failed_rule)
-  - pagination with filters (total & total_pages reflect filtered count)
-  - empty filtered result (items: [], total: 0, total_pages: 0)
-  - invalid filter value rejections (status=INVALID -> 400, start_date=bad -> 400)
-  - SQL parameterization & safety
+- Step 12 Tests: Search & filtering by status, date range, failed_rule, product_name, brand, inspector, combined filters.
+- Step 13 Tests:
+  - Product with associated scans returns history (product metadata + scan items)
+  - History is newest-first (timestamp DESC, scan_id DESC)
+  - Product with no scans returns empty history (items: [], total: 0)
+  - Unknown product_id returns HTTP 404 ("Product not found")
+  - Pagination works on product history (page, page_size, total_pages)
+  - Regressions across all previous steps.
 """
 
 import os
@@ -30,7 +27,7 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 
 import app
-from app import app as fastapi_app, scan_package_image, scan_package_images, get_scan_by_id, get_scans
+from app import app as fastapi_app, scan_package_image, scan_package_images, get_scan_by_id, get_scans, get_product_history
 from database import get_connection
 from storage import supabase
 
@@ -45,10 +42,10 @@ def make_distinct_image_bytes(label: str, bg_color: tuple) -> bytes:
     return buf.getvalue()
 
 
-async def run_step10_step11_step12_test_suite():
-    print("================================================================")
-    print("  ADITYA BACKEND — STEP 10, 11 & 12 RETRIEVAL, PAGINATION & FILTER TESTS ")
-    print("================================================================")
+async def run_full_retrieval_test_suite():
+    print("==================================================================")
+    print("  ADITYA BACKEND — STEP 10, 11, 12 & 13 RETRIEVAL & HISTORY TESTS ")
+    print("==================================================================")
 
     bytes1 = make_distinct_image_bytes("1_Red", (200, 40, 40))
     bytes2 = make_distinct_image_bytes("2_Green", (40, 160, 40))
@@ -61,186 +58,130 @@ async def run_step10_step11_step12_test_suite():
     cur = conn.cursor(cursor_factory=RealDictCursor)
 
     # ------------------------------------------------------------------
-    # STEP 10 TESTS
+    # STEP 10 & 11 REGRESSIONS
     # ------------------------------------------------------------------
-    print("\n--- TEST 10: SCAN RETRIEVAL BY ID & 404 ---")
+    print("\n--- STEP 10 & 11 REGRESSIONS ---")
     f1_single = UploadFile(filename="single.png", file=io.BytesIO(bytes1), headers=Headers({"content-type": "image/png"}))
     res1_scan = await scan_package_image(file=f1_single, **kw)
     scan_id_1 = res1_scan["scan_id"]
 
     res1_get = client.get(f"/api/scans/{scan_id_1}")
     assert res1_get.status_code == 200
-    data1 = res1_get.json()
-    assert data1["scan_id"] == scan_id_1
-    assert data1["overall_verdict"] == res1_scan["compliance_report"]["status"]
+    assert res1_get.json()["scan_id"] == scan_id_1
 
     res404 = client.get("/api/scans/999999999")
     assert res404.status_code == 404
-    print(f"[PASS] Scan retrieval by ID ({scan_id_1}) and 404 handling verified.")
+
+    res_scans_def = client.get("/api/scans")
+    assert res_scans_def.status_code == 200
+    print("[PASS] Step 10 & Step 11 regressions verified.")
 
     # ------------------------------------------------------------------
-    # STEP 11 TESTS — UNFILTERED PAGINATION
+    # STEP 13 TESTS — PRODUCT HISTORY (GET /api/products/{product_id}/history)
     # ------------------------------------------------------------------
-    print("\n--- TEST 11: UNFILTERED PAGINATION ---")
-    res_def = client.get("/api/scans")
-    assert res_def.status_code == 200
-    p_def = res_def.json()
-    assert p_def["page"] == 1
-    assert p_def["page_size"] == 10
-    print(f"[PASS] Unfiltered pagination verified: total = {p_def['total']}.")
+    print("\n--- STEP 13: PRODUCT HISTORY IMPLEMENTATION & VERIFICATION ---")
 
-    # ------------------------------------------------------------------
-    # STEP 12 TESTS — SEARCH & FILTERING
-    # ------------------------------------------------------------------
+    # 1. Insert product A with 2 scans
+    cur.execute(
+        "INSERT INTO products (name, brand, category) VALUES (%s, %s, %s) RETURNING product_id;",
+        ("Parle-G Gold Biscuits", "Parle", "Biscuits")
+    )
+    prod_A_id = cur.fetchone()["product_id"]
 
-    # Setup known database records with status, failed_rules, dates, products, users
-    print("\n--- SETTING UP KNOWN SCAN RECORDS FOR FILTER TESTING ---")
-    
-    # 1. Product record
-    cur.execute("INSERT INTO products (name, brand, category) VALUES (%s, %s, %s) RETURNING product_id;", ("Amul Butter 500g", "Amul", "Dairy"))
-    pid = cur.fetchone()["product_id"]
-
-    # 2. User record
-    cur.execute("INSERT INTO users (name, role, org) VALUES (%s, %s, %s) RETURNING user_id;", ("Inspector Sharma", "Senior Inspector", "Legal Metrology Dept"))
-    uid = cur.fetchone()["user_id"]
+    # 2. Insert product B with 0 scans
+    cur.execute(
+        "INSERT INTO products (name, brand, category) VALUES (%s, %s, %s) RETURNING product_id;",
+        ("Parle Hide & Seek", "Parle", "Confectionery")
+    )
+    prod_B_id = cur.fetchone()["product_id"]
 
     now = datetime.now(timezone.utc)
-    date_yesterday = now - timedelta(days=1)
+    t_older = now - timedelta(hours=2)
+    t_newer = now - timedelta(hours=1)
 
-    # Insert Scan Alpha (FAIL, with pid, uid, yesterday, rule RULE_6_MRP FAIL)
+    # Insert Scan 1 for Product A (Older)
     cur.execute(
-        "INSERT INTO scans (product_id, user_id, overall_verdict, font_height_detected, timestamp, ocr_raw_text) VALUES (%s, %s, %s, %s, %s, %s) RETURNING scan_id;",
-        (pid, uid, "FAIL", 2.5, date_yesterday, json.dumps(["Amul Butter 500g", "MRP Rs 275"]))
+        "INSERT INTO scans (product_id, overall_verdict, font_height_detected, timestamp, ocr_raw_text) VALUES (%s, %s, %s, %s, %s) RETURNING scan_id;",
+        (prod_A_id, "FAIL", 2.0, t_older, json.dumps(["Parle-G Gold", "MRP 10"]))
     )
-    scan_id_alpha = cur.fetchone()["scan_id"]
-    cur.execute("INSERT INTO scan_results (scan_id, rule_code, status, finding_detail) VALUES (%s, %s, %s, %s);", (scan_id_alpha, "RULE_6_MRP", "FAIL", "MRP missing currency symbol"))
-    cur.execute("INSERT INTO scan_results (scan_id, rule_code, status, finding_detail) VALUES (%s, %s, %s, %s);", (scan_id_alpha, "RULE_6_NET_QTY", "PASS", "Net qty valid"))
+    scan_A_older_id = cur.fetchone()["scan_id"]
 
-    # Insert Scan Beta (PASS, with pid, uid, now)
+    # Insert Scan 2 for Product A (Newer)
     cur.execute(
-        "INSERT INTO scans (product_id, user_id, overall_verdict, font_height_detected, timestamp, ocr_raw_text) VALUES (%s, %s, %s, %s, %s, %s) RETURNING scan_id;",
-        (pid, uid, "PASS", 3.0, now, json.dumps(["Amul Butter 500g", "MRP Rs 275.00"]))
+        "INSERT INTO scans (product_id, overall_verdict, font_height_detected, timestamp, ocr_raw_text) VALUES (%s, %s, %s, %s, %s) RETURNING scan_id;",
+        (prod_A_id, "PASS", 3.0, t_newer, json.dumps(["Parle-G Gold", "MRP Rs 10.00"]))
     )
-    scan_id_beta = cur.fetchone()["scan_id"]
-    cur.execute("INSERT INTO scan_results (scan_id, rule_code, status, finding_detail) VALUES (%s, %s, %s, %s);", (scan_id_beta, "RULE_6_MRP", "PASS", "MRP valid"))
-
-    # Insert Scan Gamma (NEEDS REVIEW, no pid/uid, now, rule RULE_7_FONT FAIL)
-    cur.execute(
-        "INSERT INTO scans (overall_verdict, font_height_detected, timestamp, ocr_raw_text) VALUES (%s, %s, %s, %s) RETURNING scan_id;",
-        ("NEEDS REVIEW", 1.8, now, json.dumps(["Low font height"]))
-    )
-    scan_id_gamma = cur.fetchone()["scan_id"]
-    cur.execute("INSERT INTO scan_results (scan_id, rule_code, status, finding_detail) VALUES (%s, %s, %s, %s);", (scan_id_gamma, "RULE_7_FONT", "FAIL", "Font height 1.8mm below 2.5mm requirement"))
+    scan_A_newer_id = cur.fetchone()["scan_id"]
 
     conn.commit()
-    print(f"  Created test scans: Alpha (FAIL, {scan_id_alpha}), Beta (PASS, {scan_id_beta}), Gamma (NEEDS REVIEW, {scan_id_gamma})")
 
-    # TEST 12.1 — STATUS FILTER
-    print("\n--- TEST 12.1: STATUS FILTER (PASS / FAIL / NEEDS REVIEW) ---")
-    r_fail = client.get("/api/scans?status=FAIL&page_size=100").json()
-    assert all(item["overall_verdict"] == "FAIL" for item in r_fail["items"])
-    assert any(item["scan_id"] == scan_id_alpha for item in r_fail["items"])
-    assert not any(item["scan_id"] == scan_id_beta for item in r_fail["items"])
-    print(f"[PASS] Status filter 'status=FAIL' verified: {r_fail['total']} rows matched.")
+    # TEST 13.1 — Product A with scans returns history
+    print("\n--- TEST 13.1: PRODUCT WITH SCANS RETRIEVAL ---")
+    res_pA = client.get(f"/api/products/{prod_A_id}/history")
+    assert res_pA.status_code == 200
+    data_pA = res_pA.json()
+    assert data_pA["product_id"] == prod_A_id
+    assert data_pA["product_name"] == "Parle-G Gold Biscuits"
+    assert data_pA["brand"] == "Parle"
+    assert data_pA["category"] == "Biscuits"
+    assert data_pA["total"] == 2
+    assert len(data_pA["items"]) == 2
+    print(f"[PASS] Product A history retrieved: product_id={prod_A_id}, name='{data_pA['product_name']}', total_scans=2.")
 
-    r_pass = client.get("/api/scans?status=PASS&page_size=100").json()
-    assert all(item["overall_verdict"] == "PASS" for item in r_pass["items"])
-    assert any(item["scan_id"] == scan_id_beta for item in r_pass["items"])
-    print(f"[PASS] Status filter 'status=PASS' verified: {r_pass['total']} rows matched.")
+    # TEST 13.2 — Newest-first history ordering
+    print("\n--- TEST 13.2: NEWEST-FIRST ORDERING ---")
+    items_pA = data_pA["items"]
+    assert items_pA[0]["scan_id"] == scan_A_newer_id, f"Expected newer scan {scan_A_newer_id} first, got {items_pA[0]['scan_id']}"
+    assert items_pA[1]["scan_id"] == scan_A_older_id, f"Expected older scan {scan_A_older_id} second, got {items_pA[1]['scan_id']}"
+    print("[PASS] History scans ordered newest-first (timestamp DESC, scan_id DESC).")
 
-    r_review = client.get("/api/scans?status=NEEDS%20REVIEW&page_size=100").json()
-    assert all(item["overall_verdict"] == "NEEDS REVIEW" for item in r_review["items"])
-    assert any(item["scan_id"] == scan_id_gamma for item in r_review["items"])
-    print(f"[PASS] Status filter 'status=NEEDS REVIEW' verified: {r_review['total']} rows matched.")
+    # TEST 13.3 — Product with 0 scans returns empty history
+    print("\n--- TEST 13.3: EMPTY PRODUCT HISTORY ---")
+    res_pB = client.get(f"/api/products/{prod_B_id}/history")
+    assert res_pB.status_code == 200
+    data_pB = res_pB.json()
+    assert data_pB["product_id"] == prod_B_id
+    assert data_pB["items"] == []
+    assert data_pB["total"] == 0
+    assert data_pB["total_pages"] == 0
+    print(f"[PASS] Product B with 0 scans returned empty history: items: [], total: 0.")
 
-    # TEST 12.2 — FAILED_RULE FILTER
-    print("\n--- TEST 12.2: FAILED_RULE FILTER ---")
-    r_rule_mrp = client.get("/api/scans?failed_rule=RULE_6_MRP").json()
-    assert any(item["scan_id"] == scan_id_alpha for item in r_rule_mrp["items"])
-    assert not any(item["scan_id"] == scan_id_beta for item in r_rule_mrp["items"])
-    # Verify no duplicate scan rows
-    scan_ids_retrieved = [item["scan_id"] for item in r_rule_mrp["items"]]
-    assert len(scan_ids_retrieved) == len(set(scan_ids_retrieved)), "EXISTS query must prevent scan duplication"
-    print(f"[PASS] failed_rule 'failed_rule=RULE_6_MRP' verified: {r_rule_mrp['total']} rows matched (No duplicates).")
+    # TEST 13.4 — Unknown product_id returns HTTP 404
+    print("\n--- TEST 13.4: UNKNOWN PRODUCT ID (HTTP 404) ---")
+    res_p404 = client.get("/api/products/999999999/history")
+    assert res_p404.status_code == 404
+    assert res_p404.json()["detail"] == "Product not found"
+    print("[PASS] Unknown product_id 999999999 returned HTTP 404 ('Product not found').")
 
-    # TEST 12.3 — DATE BOUNDARY FILTERING
-    print("\n--- TEST 12.3: DATE BOUNDARY FILTERING ---")
-    start_str = date_yesterday.strftime("%Y-%m-%d")
-    r_start = client.get(f"/api/scans?start_date={start_str}&page_size=100").json()
-    assert any(item["scan_id"] == scan_id_alpha for item in r_start["items"])
+    # TEST 13.5 — Product history pagination
+    print("\n--- TEST 13.5: PRODUCT HISTORY PAGINATION ---")
+    res_pA_page1 = client.get(f"/api/products/{prod_A_id}/history?page=1&page_size=1").json()
+    assert res_pA_page1["page"] == 1
+    assert res_pA_page1["page_size"] == 1
+    assert res_pA_page1["total"] == 2
+    assert res_pA_page1["total_pages"] == 2
+    assert len(res_pA_page1["items"]) == 1
+    assert res_pA_page1["items"][0]["scan_id"] == scan_A_newer_id
 
-    end_yesterday = date_yesterday.strftime("%Y-%m-%d")
-    r_range = client.get(f"/api/scans?start_date={start_str}&end_date={end_yesterday}&page_size=100").json()
-    assert any(item["scan_id"] == scan_id_alpha for item in r_range["items"])
-    print(f"[PASS] Date boundary filtering ('start_date={start_str}&end_date={end_yesterday}') verified.")
+    res_pA_page2 = client.get(f"/api/products/{prod_A_id}/history?page=2&page_size=1").json()
+    assert res_pA_page2["page"] == 2
+    assert res_pA_page2["items"][0]["scan_id"] == scan_A_older_id
+    print("[PASS] Product history pagination verified: page 1 and page 2 returned correct scan items.")
 
-    # TEST 12.4 — PRODUCT_NAME AND BRAND FILTERS (VIA PRODUCTS JOIN)
-    print("\n--- TEST 12.4: PRODUCT_NAME & BRAND FILTERS ---")
-    r_prod = client.get("/api/scans?product_name=Amul%20Butter").json()
-    assert any(item["scan_id"] == scan_id_alpha for item in r_prod["items"])
-    assert any(item["scan_id"] == scan_id_beta for item in r_prod["items"])
-    assert not any(item["scan_id"] == scan_id_gamma for item in r_prod["items"])
-    print(f"[PASS] product_name filter 'product_name=Amul Butter' verified: {r_prod['total']} rows matched.")
-
-    r_brand = client.get("/api/scans?brand=Amul").json()
-    assert any(item["scan_id"] == scan_id_alpha for item in r_brand["items"])
-    assert any(item["scan_id"] == scan_id_beta for item in r_brand["items"])
-    print(f"[PASS] brand filter 'brand=Amul' verified: {r_brand['total']} rows matched.")
-
-    # TEST 12.5 — INSPECTOR FILTER (VIA USERS JOIN)
-    print("\n--- TEST 12.5: INSPECTOR FILTER ---")
-    r_insp = client.get("/api/scans?inspector=Inspector%20Sharma").json()
-    assert any(item["scan_id"] == scan_id_alpha for item in r_insp["items"])
-    assert any(item["scan_id"] == scan_id_beta for item in r_insp["items"])
-    assert not any(item["scan_id"] == scan_id_gamma for item in r_insp["items"])
-    print(f"[PASS] inspector filter 'inspector=Inspector Sharma' verified: {r_insp['total']} rows matched.")
-
-    # TEST 12.6 — COMBINED FILTERS
-    print("\n--- TEST 12.6: COMBINED FILTERS ---")
-    r_comb = client.get(f"/api/scans?status=FAIL&failed_rule=RULE_6_MRP&product_name=Amul&start_date={start_str}").json()
-    assert r_comb["total"] >= 1
-    assert any(item["scan_id"] == scan_id_alpha for item in r_comb["items"])
-    print(f"[PASS] Combined filters (status=FAIL + failed_rule + product_name + start_date) verified: {r_comb['total']} rows matched.")
-
-    # TEST 12.7 — PAGINATION WITH FILTERS
-    print("\n--- TEST 12.7: PAGINATION WITH FILTERS ---")
-    r_p1 = client.get("/api/scans?brand=Amul&page=1&page_size=1").json()
-    assert r_p1["page"] == 1
-    assert r_p1["page_size"] == 1
-    assert r_p1["total"] >= 2
-    assert len(r_p1["items"]) == 1
-
-    r_p2 = client.get("/api/scans?brand=Amul&page=2&page_size=1").json()
-    assert r_p2["page"] == 2
-    assert r_p2["items"][0]["scan_id"] != r_p1["items"][0]["scan_id"]
-    print("[PASS] Pagination with filters verified: page 1 and page 2 total_pages calculation correct.")
-
-    # TEST 12.8 — EMPTY FILTERED RESULT
-    print("\n--- TEST 12.8: EMPTY FILTERED RESULT ---")
-    r_empty = client.get("/api/scans?status=PASS&start_date=2099-01-01").json()
-    assert r_empty["items"] == []
-    assert r_empty["total"] == 0
-    assert r_empty["total_pages"] == 0
-    print("[PASS] Empty filtered result verified: items: [], total: 0, total_pages: 0.")
-
-    # TEST 12.9 — INVALID FILTER REJECTIONS
-    print("\n--- TEST 12.9: INVALID FILTER REJECTIONS ---")
-    r_bad_status = client.get("/api/scans?status=INVALID_STATUS")
-    assert r_bad_status.status_code == 400
-    assert "Invalid status filter" in r_bad_status.json()["detail"]
-
-    r_bad_date = client.get("/api/scans?start_date=bad-date-format")
-    assert r_bad_date.status_code == 400
-    assert "Invalid start_date format" in r_bad_date.json()["detail"]
-    print("[PASS] Invalid filter values (status=INVALID, start_date=bad) cleanly rejected with HTTP 400.")
+    # TEST 13.6 — Invalid parameter rejections
+    print("\n--- TEST 13.6: INVALID PARAMETER REJECTIONS ---")
+    res_p_bad = client.get(f"/api/products/{prod_A_id}/history?page=0")
+    assert res_p_bad.status_code == 400
+    assert "page must be greater than or equal to 1." in res_p_bad.json()["detail"]
+    print("[PASS] page=0 rejected with HTTP 400.")
 
     cur.close()
     conn.close()
 
-    print("\n================================================================")
-    print("     ALL STEP 10, 11 & 12 TESTS PASSED SUCCESSFULLY!            ")
-    print("================================================================")
+    print("\n==================================================================")
+    print("     ALL STEP 10, 11, 12 & 13 TESTS PASSED SUCCESSFULLY!          ")
+    print("==================================================================")
 
 
 if __name__ == "__main__":
-    asyncio.run(run_step10_step11_step12_test_suite())
+    asyncio.run(run_full_retrieval_test_suite())

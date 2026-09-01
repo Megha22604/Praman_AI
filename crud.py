@@ -311,3 +311,75 @@ def get_paginated_scans(
             "total": total,
             "total_pages": total_pages
         }
+
+
+def get_product(conn, product_id: int):
+    """
+    Fetches a single product record by product_id from the products table.
+    Returns a dictionary or None if not found.
+    """
+    with conn.cursor() as cur:
+        query = """
+        SELECT product_id, name, brand, category, created_at
+        FROM products
+        WHERE product_id = %s;
+        """
+        cur.execute(query, (product_id,))
+        row = cur.fetchone()
+        if not row:
+            return None
+        if isinstance(row, dict):
+            return row
+        columns = [desc[0] for desc in cur.description]
+        return dict(zip(columns, row))
+
+
+def get_paginated_scans_for_product(conn, product_id: int, page: int = 1, page_size: int = 10):
+    """
+    Fetches paginated scan records for a specific product_id ordered by timestamp DESC, scan_id DESC.
+    Returns a dictionary containing items, page, page_size, total, and total_pages.
+    """
+    offset = (page - 1) * page_size
+    with conn.cursor() as cur:
+        # 1. Total count query
+        cur.execute("SELECT COUNT(*) FROM scans WHERE product_id = %s;", (product_id,))
+        count_row = cur.fetchone()
+        total = count_row[0] if not isinstance(count_row, dict) else list(count_row.values())[0]
+
+        total_pages = math.ceil(total / page_size) if total > 0 else 0
+
+        # 2. Paginated data query
+        query = """
+        SELECT
+            scan_id,
+            product_id,
+            user_id,
+            image_url,
+            timestamp,
+            overall_verdict,
+            font_height_detected,
+            org,
+            ocr_raw_text
+        FROM scans
+        WHERE product_id = %s
+        ORDER BY timestamp DESC, scan_id DESC
+        LIMIT %s OFFSET %s;
+        """
+        cur.execute(query, (product_id, page_size, offset))
+        rows = cur.fetchall()
+
+        items = []
+        if rows:
+            if isinstance(rows[0], dict):
+                items = rows
+            else:
+                columns = [desc[0] for desc in cur.description]
+                items = [dict(zip(columns, row)) for row in rows]
+
+        return {
+            "items": items,
+            "page": page,
+            "page_size": page_size,
+            "total": total,
+            "total_pages": total_pages
+        }

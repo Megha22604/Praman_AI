@@ -185,6 +185,18 @@ UI_HTML = """
                         </a>
                     </div>
 
+                    <!-- Misleading / Non-Standard Claims Advisory Card (Shown only if detected) -->
+                    <div id="misleadingCard" class="hidden bg-amber-950/30 border border-amber-500/30 rounded-2xl p-4 shadow-lg space-y-3">
+                        <div class="flex items-center justify-between">
+                            <h4 class="text-xs sm:text-sm font-bold text-amber-300 flex items-center gap-2">
+                                <i class="fa-solid fa-triangle-exclamation text-amber-400"></i> Advisory: Non-Standard / Misleading Declarations
+                            </h4>
+                            <span class="text-[10px] font-bold px-2 py-0.5 rounded-full bg-amber-500/20 text-amber-300 border border-amber-500/30 uppercase">Needs Review</span>
+                        </div>
+                        <p class="text-[11px] text-amber-200/80">The following non-standard or promotional declarations were identified and require human / legal verification:</p>
+                        <div id="misleadingList" class="space-y-1.5 text-xs"></div>
+                    </div>
+
                     <!-- Findings Table Card -->
                     <div class="bg-slate-800/80 border border-slate-700/80 rounded-2xl overflow-hidden shadow-xl">
                         <div class="p-3.5 sm:p-4 border-b border-slate-700/80 flex items-center justify-between">
@@ -301,7 +313,7 @@ UI_HTML = """
 
         function renderResults(data) {
             const report = data.compliance_report;
-            const isCompliant = report.compliant;
+            const status = report.status || (report.compliant ? 'PASS' : 'FAIL');
 
             // Status Banner
             const banner = document.getElementById('statusBanner');
@@ -310,12 +322,18 @@ UI_HTML = """
             const subtitle = document.getElementById('statusSubtitle');
             const scoreBadge = document.getElementById('scoreBadge');
 
-            if (isCompliant) {
+            if (status === 'PASS') {
                 banner.className = 'rounded-2xl p-4 sm:p-5 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 shadow-lg border bg-emerald-950/40 border-emerald-500/30 text-emerald-300';
                 icon.innerHTML = '<i class="fa-solid fa-circle-check text-emerald-400 text-lg sm:text-xl"></i>';
                 title.innerText = 'Fully Compliant';
-                subtitle.innerText = 'All mandatory statutory declarations detected and validated.';
+                subtitle.innerText = 'All statutory declarations detected and validated.';
                 scoreBadge.className = 'text-[11px] font-bold px-2.5 py-0.5 rounded-full bg-emerald-500/20 text-emerald-400 border border-emerald-500/30';
+            } else if (status === 'NEEDS REVIEW') {
+                banner.className = 'rounded-2xl p-4 sm:p-5 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 shadow-lg border bg-amber-950/40 border-amber-500/30 text-amber-300';
+                icon.innerHTML = '<i class="fa-solid fa-eye text-amber-400 text-lg sm:text-xl"></i>';
+                title.innerText = 'Manual Review Required';
+                subtitle.innerText = 'Low-confidence OCR reads or non-standard declarations need manual verification.';
+                scoreBadge.className = 'text-[11px] font-bold px-2.5 py-0.5 rounded-full bg-amber-500/20 text-amber-400 border border-amber-500/30';
             } else {
                 banner.className = 'rounded-2xl p-4 sm:p-5 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 shadow-lg border bg-rose-950/40 border-rose-500/30 text-rose-300';
                 icon.innerHTML = '<i class="fa-solid fa-triangle-exclamation text-rose-400 text-lg sm:text-xl"></i>';
@@ -333,8 +351,12 @@ UI_HTML = """
                 const tr = document.createElement('tr');
                 tr.className = 'hover:bg-slate-800/40 transition';
 
-                const statusPill = item.pass 
+                const itemStatus = item.status || (item.pass ? 'PASS' : 'FAIL');
+
+                const statusPill = itemStatus === 'PASS' 
                     ? '<span class="inline-flex items-center px-2 py-0.5 rounded text-[10px] font-semibold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">PASS</span>'
+                    : itemStatus === 'NEEDS REVIEW'
+                    ? '<span class="inline-flex items-center px-2 py-0.5 rounded text-[10px] font-semibold bg-amber-500/10 text-amber-400 border border-amber-500/20">NEEDS REVIEW</span>'
                     : '<span class="inline-flex items-center px-2 py-0.5 rounded text-[10px] font-semibold bg-rose-500/10 text-rose-400 border border-rose-500/20">FAIL</span>';
 
                 tr.innerHTML = `
@@ -345,6 +367,30 @@ UI_HTML = """
                 `;
                 tbody.appendChild(tr);
             });
+
+            // Misleading Declarations Advisory Card
+            const misleadingCard = document.getElementById('misleadingCard');
+            const misleadingList = document.getElementById('misleadingList');
+            const misleadingInfo = report.misleading_declarations;
+
+            if (misleadingInfo && misleadingInfo.detected && misleadingInfo.findings && misleadingInfo.findings.length > 0) {
+                misleadingCard.classList.remove('hidden');
+                misleadingList.innerHTML = '';
+                misleadingInfo.findings.forEach(f => {
+                    const div = document.createElement('div');
+                    div.className = 'p-2.5 rounded-xl bg-amber-900/20 border border-amber-500/20 text-amber-200 flex flex-col sm:flex-row sm:items-center justify-between gap-1.5 text-[11px]';
+                    div.innerHTML = `
+                        <div class="flex items-center gap-2">
+                            <span class="font-bold text-white bg-amber-500/30 px-2 py-0.5 rounded text-[10px]">'${f.claim}'</span>
+                            <span class="text-amber-200/90">${f.reason}</span>
+                        </div>
+                        <span class="text-[10px] font-semibold text-amber-400 shrink-0 uppercase tracking-wide bg-amber-500/10 px-2 py-0.5 rounded border border-amber-500/20">${f.category}</span>
+                    `;
+                    misleadingList.appendChild(div);
+                });
+            } else {
+                misleadingCard.classList.add('hidden');
+            }
 
             // Raw OCR Token Display
             const tokensBox = document.getElementById('ocrTokens');
@@ -364,6 +410,11 @@ UI_HTML = """
 </body>
 </html>
 """
+
+@app.get("/", response_class=HTMLResponse)
+def root_redirect():
+    """Root URL — redirects to UI."""
+    return HTMLResponse(content=UI_HTML)
 
 @app.get("/ui", response_class=HTMLResponse)
 def get_user_interface():

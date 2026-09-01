@@ -4,6 +4,8 @@ Provides database access functions for creating and reading scan records.
 Functions accept an active psycopg2 connection and do not manage transactions internally.
 """
 
+import json
+
 def create_scan(
     conn,
     product_id=None,
@@ -11,12 +13,20 @@ def create_scan(
     image_url=None,
     overall_verdict=None,
     font_height_detected=None,
-    org=None
+    org=None,
+    ocr_raw_text=None
 ):
     """
     Inserts a new record into the scans table and returns the generated scan_id.
     Caller controls the transaction.
     """
+    ocr_json = None
+    if ocr_raw_text is not None:
+        if isinstance(ocr_raw_text, (list, dict)):
+            ocr_json = json.dumps(ocr_raw_text)
+        elif isinstance(ocr_raw_text, str):
+            ocr_json = ocr_raw_text
+
     with conn.cursor() as cur:
         query = """
         INSERT INTO scans (
@@ -25,12 +35,13 @@ def create_scan(
             image_url,
             overall_verdict,
             font_height_detected,
-            org
+            org,
+            ocr_raw_text
         )
-        VALUES (%s, %s, %s, %s, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
         RETURNING scan_id;
         """
-        cur.execute(query, (product_id, user_id, image_url, overall_verdict, font_height_detected, org))
+        cur.execute(query, (product_id, user_id, image_url, overall_verdict, font_height_detected, org, ocr_json))
         scan_id = cur.fetchone()[0]
         return scan_id
 
@@ -77,7 +88,8 @@ def get_scan(conn, scan_id):
             timestamp,
             overall_verdict,
             font_height_detected,
-            org
+            org,
+            ocr_raw_text
         FROM scans
         WHERE scan_id = %s;
         """

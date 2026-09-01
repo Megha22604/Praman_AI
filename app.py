@@ -462,7 +462,8 @@ async def scan_package_image(
             image_url=None,  # scans.image_url remains None
             overall_verdict=compliance_results.get("status"),
             font_height_detected=detected_font_height_mm,
-            org=None
+            org=None,
+            ocr_raw_text=raw_lines
         )
 
         # Determine safe file extension
@@ -595,7 +596,8 @@ async def scan_package_images(
             image_url=None,  # scans.image_url remains NULL
             overall_verdict=compliance_results.get("status"),
             font_height_detected=detected_font_height_mm,
-            org=None
+            org=None,
+            ocr_raw_text=combined_raw_lines
         )
 
         # 2. Upload each image to Supabase Storage & insert into images table

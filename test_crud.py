@@ -25,6 +25,8 @@ def run_crud_tests():
         test_font_height = 2.5
         test_org = "PramanAI CRUD TEST"
 
+        test_ocr = ["Test Line 1", "Test Line 2"]
+
         scan_id = create_scan(
             conn,
             product_id=test_product_id,
@@ -32,7 +34,8 @@ def run_crud_tests():
             image_url=None,
             overall_verdict=test_verdict,
             font_height_detected=test_font_height,
-            org=test_org
+            org=test_org,
+            ocr_raw_text=test_ocr
         )
 
         if not isinstance(scan_id, (int, float)) or scan_id <= 0:
@@ -66,6 +69,7 @@ def run_crud_tests():
         assert scan_data["overall_verdict"] == test_verdict, f"Expected overall_verdict '{test_verdict}', got '{scan_data['overall_verdict']}'"
         assert float(scan_data["font_height_detected"]) == test_font_height, f"Expected font_height_detected {test_font_height}, got {scan_data['font_height_detected']}"
         assert scan_data["org"] == test_org, f"Expected org '{test_org}', got '{scan_data['org']}'"
+        assert scan_data["ocr_raw_text"] == test_ocr, f"Expected ocr_raw_text {test_ocr}, got {scan_data['ocr_raw_text']}"
 
         print("  [PASS] All field assertions matched expected values!")
 

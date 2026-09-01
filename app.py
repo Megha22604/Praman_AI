@@ -536,62 +536,40 @@ async def scan_package_image(
 @app.post("/api/scan-images")
 async def scan_package_images(
     files: list[UploadFile] = File(...),
-    image_types: list[str] = Form(...),
     package_height_cm: float = Form(15.0),
     package_width_cm: float = Form(10.0),
     detected_font_height_mm: float = Form(2.5)
 ):
     """
     Multi-image packaging inspection endpoint (Step 8).
-    Accepts 1 to 3 images (front, back, close-up), extracts combined OCR tokens,
+    Accepts 1 to 5 images, extracts combined OCR tokens,
     executes LMPC rules evaluation once, uploads files to Supabase Storage,
     and persists records in PostgreSQL scans, images, and scan_results tables.
     """
     global latest_report_cache
 
-    MAX_IMAGES = 3
-    ALLOWED_TYPES = {"front", "back", "close-up"}
+    MAX_IMAGES = 5
 
     if not files or len(files) > MAX_IMAGES:
         raise HTTPException(status_code=400, detail=f"Number of images must be between 1 and {MAX_IMAGES}.")
-
-    # Normalize image_types if passed as list of strings or single string/JSON
-    types_list = []
-    for t in image_types:
-        if isinstance(t, str) and ("," in t or t.startswith("[")):
-            if t.startswith("["):
-                import json
-                types_list.extend(json.loads(t))
-            else:
-                types_list.extend([x.strip() for x in t.split(",") if x.strip()])
-        else:
-            types_list.append(str(t).strip())
-
-    if len(files) != len(types_list):
-        raise HTTPException(status_code=400, detail="Each uploaded file must have a corresponding image_type.")
-
-    for img_type in types_list:
-        if img_type.lower() not in ALLOWED_TYPES:
-            raise HTTPException(status_code=400, detail=f"Invalid image_type '{img_type}'. Allowed values: 'front', 'back', 'close-up'.")
 
     # Validate content types & read file binaries
     image_payloads = []
     combined_raw_lines = []
 
     for idx, file_obj in enumerate(files):
-        if not file_obj.content_type.startswith("image/"):
-            raise HTTPException(status_code=400, detail=f"File {file_obj.filename} must be a valid image.")
+        if not file_obj.content_type or not file_obj.content_type.startswith("image/"):
+            raise HTTPException(status_code=400, detail="All uploaded files must be images.")
 
         file_bytes = await file_obj.read()
         lines = extract_text_lines_from_image(file_bytes)
         combined_raw_lines.extend(lines)
 
-        img_type = types_list[idx].lower()
         image_payloads.append({
             "file_bytes": file_bytes,
             "filename": file_obj.filename,
             "content_type": file_obj.content_type,
-            "image_type": img_type
+            "image_type": None
         })
 
     # Evaluate rules engine ONCE across combined OCR lines
@@ -621,7 +599,7 @@ async def scan_package_images(
         )
 
         # 2. Upload each image to Supabase Storage & insert into images table
-        for item in image_payloads:
+        for idx, item in enumerate(image_payloads):
             img_type = item["image_type"]
             ext = "png"
             if item["filename"] and "." in item["filename"]:
@@ -630,7 +608,7 @@ async def scan_package_images(
                 if "jpeg" in item["content_type"] or "jpg" in item["content_type"]:
                     ext = "jpg"
 
-            storage_path = f"scan-{scan_id}/{img_type}.{ext}"
+            storage_path = f"scan-{scan_id}/img_{idx + 1}.{ext}"
             content_type = item["content_type"] or f"image/{ext}"
 
             upload_image(
@@ -710,3 +688,26 @@ def export_official_notice_pdf():
         media_type="application/pdf",
         filename="PramanAI_Inspection_Notice.pdf"
     )
+
+
+def custom_openapi():
+    if app.openapi_schema:
+        return app.openapi_schema
+    from fastapi.openapi.utils import get_openapi
+    openapi_schema = get_openapi(
+        title=app.title,
+        version=app.version,
+        description=app.description,
+        routes=app.routes,
+    )
+    schemas = openapi_schema.get("components", {}).get("schemas", {})
+    for schema_name, schema_val in schemas.items():
+        if "scan_package_images" in schema_name and "properties" in schema_val:
+            files_prop = schema_val["properties"].get("files", {})
+            if files_prop.get("type") == "array" and "items" in files_prop:
+                files_prop["items"]["format"] = "binary"
+    app.openapi_schema = openapi_schema
+    return app.openapi_schema
+
+
+app.openapi = custom_openapi

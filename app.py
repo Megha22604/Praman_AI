@@ -3,7 +3,7 @@ from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.responses import HTMLResponse, FileResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 
-from ocr_engine import extract_text_lines_from_image
+from ocr_engine import extract_text_lines_from_image, extract_text_lines_with_confidence
 from rules_engine import evaluate_all_rules
 from report_generator import generate_pdf_report
 from calibration import generate_marker_png_bytes, calibrate_package_dimensions
@@ -227,9 +227,12 @@ UI_HTML = """
                             <span class="text-xs font-semibold text-slate-300 flex items-center gap-1.5">
                                 <i class="fa-solid fa-receipt text-slate-400"></i> Extracted OCR Tokens
                             </span>
-                            <span id="tokenCount" class="text-[10px] text-slate-500 font-mono"></span>
+                            <div class="flex items-center gap-2">
+                                <span id="avgConfBadge" class="text-[10px] font-mono px-2 py-0.5 rounded-md font-semibold hidden"></span>
+                                <span id="tokenCount" class="text-[10px] text-slate-500 font-mono"></span>
+                            </div>
                         </div>
-                        <div id="ocrTokens" class="p-3 bg-slate-950/70 rounded-xl font-mono text-[11px] text-slate-400 max-h-36 overflow-y-auto space-y-1 custom-scrollbar">
+                        <div id="ocrTokens" class="p-3 bg-slate-950/70 rounded-xl font-mono text-[11px] text-slate-400 max-h-40 overflow-y-auto space-y-1 custom-scrollbar">
                         </div>
                     </div>
 
@@ -378,15 +381,53 @@ UI_HTML = """
                 tbody.appendChild(tr);
             });
 
-            // Raw OCR Token Display
+            // OCR Token Display with Confidence
             const tokensBox = document.getElementById('ocrTokens');
             tokensBox.innerHTML = '';
-            document.getElementById('tokenCount').innerText = `${data.detected_raw_lines.length} lines detected`;
+            const lines = data.detected_lines || (data.detected_raw_lines || []).map(t => ({text: t, confidence: null}));
+            document.getElementById('tokenCount').innerText = `${lines.length} lines detected`;
 
-            data.detected_raw_lines.forEach(line => {
+            const avgBadge = document.getElementById('avgConfBadge');
+            if (data.average_confidence !== undefined && data.average_confidence !== null && lines.length > 0) {
+                avgBadge.classList.remove('hidden');
+                const avg = data.average_confidence;
+                if (avg >= 80) {
+                    avgBadge.className = 'text-[10px] font-mono px-2 py-0.5 rounded-md font-semibold bg-emerald-500/20 text-emerald-400 border border-emerald-500/30';
+                } else if (avg >= 60) {
+                    avgBadge.className = 'text-[10px] font-mono px-2 py-0.5 rounded-md font-semibold bg-amber-500/20 text-amber-400 border border-amber-500/30';
+                } else {
+                    avgBadge.className = 'text-[10px] font-mono px-2 py-0.5 rounded-md font-semibold bg-rose-500/20 text-rose-400 border border-rose-500/30';
+                }
+                avgBadge.innerText = `${avg}% Avg Conf`;
+            } else {
+                avgBadge.classList.add('hidden');
+            }
+
+            lines.forEach(item => {
                 const div = document.createElement('div');
-                div.className = 'text-slate-300 py-0.5 border-b border-slate-900/40 last:border-0';
-                div.textContent = `> ${line}`;
+                div.className = 'flex items-center justify-between gap-2 py-1 px-1.5 border-b border-slate-900/40 last:border-0 hover:bg-slate-900/40 rounded transition';
+
+                const textSpan = document.createElement('span');
+                textSpan.className = 'text-slate-300 truncate font-mono text-[11px]';
+                textSpan.textContent = `> ${item.text || item}`;
+                div.appendChild(textSpan);
+
+                if (item.confidence !== undefined && item.confidence !== null) {
+                    const confSpan = document.createElement('span');
+                    const c = item.confidence;
+                    let badgeStyle = 'bg-slate-800 text-slate-400 border border-slate-700';
+                    if (c >= 80) {
+                        badgeStyle = 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20';
+                    } else if (c >= 60) {
+                        badgeStyle = 'bg-amber-500/10 text-amber-400 border border-amber-500/20';
+                    } else {
+                        badgeStyle = 'bg-rose-500/10 text-rose-400 border border-rose-500/20';
+                    }
+                    confSpan.className = `text-[9px] font-mono px-1.5 py-0.5 rounded font-medium shrink-0 ${badgeStyle}`;
+                    confSpan.textContent = `${c}%`;
+                    div.appendChild(confSpan);
+                }
+
                 tokensBox.appendChild(div);
             });
 
@@ -426,8 +467,12 @@ async def scan_package_image(
     pkg_w = calibration.get("width_cm") if calibration.get("success") else None
     cal_err = calibration.get("message") if not calibration.get("success") else None
 
-    # 2. OCR text line extraction
-    raw_lines = extract_text_lines_from_image(image_bytes)
+    # 2. OCR text line extraction with per-line confidence scores
+    detected_lines = extract_text_lines_with_confidence(image_bytes)
+    raw_lines = [item["text"] for item in detected_lines]
+
+    confs = [item["confidence"] for item in detected_lines if item.get("confidence") is not None]
+    avg_conf = round(float(sum(confs) / len(confs)), 1) if confs else 0.0
 
     # 3. LMPC statutory rules evaluation
     compliance_results = evaluate_all_rules(
@@ -440,7 +485,9 @@ async def scan_package_image(
 
     response_payload = {
         "status": "success",
+        "detected_lines": detected_lines,
         "detected_raw_lines": raw_lines,
+        "average_confidence": avg_conf,
         "compliance_report": compliance_results,
         "dimension_calibration": calibration
     }

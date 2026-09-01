@@ -106,7 +106,7 @@ def validate_consumer_care(care_text):
         }
 
     text = str(care_text).lower()
-    has_contact = "@" in text or "email" in text or "phone" in text or "tel" in text or "toll" in text or any(char.isdigit() for char in text)
+    has_contact = "@" in text or "email" in text or "phone" in text or "tel" in text or "toll" in text or "helpline" in text or "feedback" in text or "care" in text or "consumer" in text or "manager" in text or any(char.isdigit() for char in text)
 
     if not has_contact:
         return {
@@ -328,6 +328,8 @@ def evaluate_all_rules(
 
     # 4. Date of Manufacture Match
     date_match = re.search(r"(?:mfd|mfg|packed|pkd|use\s*by|date|b\.no\.?)[:\s]*([0-3]?[0-9][/-][0-1]?[0-9][/-](?:20)?[2-3][0-9]|[0-1]?[0-9][/-](?:20)?[2-3][0-9]|[a-z]{3}[/-]?(?:20)?[2-3][0-9])", lower_text)
+    if not date_match:
+        date_match = re.search(r"\b([0-3]?[0-9][/-][0-1]?[0-9][/-](?:20)?[2-3][0-9]|[0-1]?[0-9][/-](?:20)?[2-3][0-9])\b", lower_text)
     if date_match or any(k in lower_text for k in ["mfd", "mfg", "pkd", "packed", "use by"]):
         extracted_data["mfg_date"] = date_match.group(0) if date_match else "Date declared"
 

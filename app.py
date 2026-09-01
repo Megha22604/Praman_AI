@@ -6,6 +6,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from ocr_engine import extract_text_lines_from_image
 from rules_engine import evaluate_all_rules
 from report_generator import generate_pdf_report
+from database import get_connection
+from crud import create_scan, create_scan_result, create_image
+from storage import upload_image, delete_image
 
 app = FastAPI(
     title="PramanAI Compliance Engine",
@@ -447,8 +450,79 @@ async def scan_package_image(
         detected_font_height_mm=detected_font_height_mm
     )
 
+    # Database Persistence & Storage Upload (Step 7 Integration)
+    conn = None
+    uploaded_storage_path = None
+    try:
+        conn = get_connection()
+        scan_id = create_scan(
+            conn,
+            product_id=None,
+            user_id=None,
+            image_url=None,  # scans.image_url remains None
+            overall_verdict=compliance_results.get("status"),
+            font_height_detected=detected_font_height_mm,
+            org=None
+        )
+
+        # Determine safe file extension
+        ext = "png"
+        if file.filename and "." in file.filename:
+            ext = file.filename.rsplit(".", 1)[-1].lower()
+        elif file.content_type:
+            if "jpeg" in file.content_type or "jpg" in file.content_type:
+                ext = "jpg"
+            elif "png" in file.content_type:
+                ext = "png"
+
+        storage_path = f"scan-{scan_id}/original.{ext}"
+        content_type = file.content_type or f"image/{ext}"
+
+        # Upload image to Supabase Storage
+        upload_image(image_bytes=image_bytes, storage_path=storage_path, content_type=content_type)
+        uploaded_storage_path = storage_path
+
+        # Create images record in PostgreSQL referencing Storage path
+        create_image(
+            conn,
+            scan_id=scan_id,
+            image_url=storage_path,
+            image_type=None
+        )
+
+        # Create scan_results records
+        for result in compliance_results.get("results", []):
+            create_scan_result(
+                conn,
+                scan_id=scan_id,
+                rule_code=result["rule"],
+                status=result["status"],
+                finding_detail=result.get("reason")
+            )
+
+        conn.commit()
+    except Exception as e:
+        if conn:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        
+        # Rollback storage upload if DB transaction failed after storage upload
+        if uploaded_storage_path:
+            try:
+                delete_image(uploaded_storage_path)
+            except Exception as cleanup_err:
+                print(f"Cleanup Failure: Could not remove {uploaded_storage_path}: {cleanup_err}")
+
+        raise HTTPException(status_code=500, detail=f"Database & storage transaction failed: {str(e)}")
+    finally:
+        if conn:
+            conn.close()
+
     response_payload = {
         "status": "success",
+        "scan_id": scan_id,
         "detected_raw_lines": raw_lines,
         "compliance_report": compliance_results
     }
@@ -456,6 +530,169 @@ async def scan_package_image(
     # Store for PDF generator
     latest_report_cache = response_payload
 
+    return response_payload
+
+
+@app.post("/api/scan-images")
+async def scan_package_images(
+    files: list[UploadFile] = File(...),
+    image_types: list[str] = Form(...),
+    package_height_cm: float = Form(15.0),
+    package_width_cm: float = Form(10.0),
+    detected_font_height_mm: float = Form(2.5)
+):
+    """
+    Multi-image packaging inspection endpoint (Step 8).
+    Accepts 1 to 3 images (front, back, close-up), extracts combined OCR tokens,
+    executes LMPC rules evaluation once, uploads files to Supabase Storage,
+    and persists records in PostgreSQL scans, images, and scan_results tables.
+    """
+    global latest_report_cache
+
+    MAX_IMAGES = 3
+    ALLOWED_TYPES = {"front", "back", "close-up"}
+
+    if not files or len(files) > MAX_IMAGES:
+        raise HTTPException(status_code=400, detail=f"Number of images must be between 1 and {MAX_IMAGES}.")
+
+    # Normalize image_types if passed as list of strings or single string/JSON
+    types_list = []
+    for t in image_types:
+        if isinstance(t, str) and ("," in t or t.startswith("[")):
+            if t.startswith("["):
+                import json
+                types_list.extend(json.loads(t))
+            else:
+                types_list.extend([x.strip() for x in t.split(",") if x.strip()])
+        else:
+            types_list.append(str(t).strip())
+
+    if len(files) != len(types_list):
+        raise HTTPException(status_code=400, detail="Each uploaded file must have a corresponding image_type.")
+
+    for img_type in types_list:
+        if img_type.lower() not in ALLOWED_TYPES:
+            raise HTTPException(status_code=400, detail=f"Invalid image_type '{img_type}'. Allowed values: 'front', 'back', 'close-up'.")
+
+    # Validate content types & read file binaries
+    image_payloads = []
+    combined_raw_lines = []
+
+    for idx, file_obj in enumerate(files):
+        if not file_obj.content_type.startswith("image/"):
+            raise HTTPException(status_code=400, detail=f"File {file_obj.filename} must be a valid image.")
+
+        file_bytes = await file_obj.read()
+        lines = extract_text_lines_from_image(file_bytes)
+        combined_raw_lines.extend(lines)
+
+        img_type = types_list[idx].lower()
+        image_payloads.append({
+            "file_bytes": file_bytes,
+            "filename": file_obj.filename,
+            "content_type": file_obj.content_type,
+            "image_type": img_type
+        })
+
+    # Evaluate rules engine ONCE across combined OCR lines
+    compliance_results = evaluate_all_rules(
+        raw_lines=combined_raw_lines,
+        package_height_cm=package_height_cm,
+        package_width_cm=package_width_cm,
+        detected_font_height_mm=detected_font_height_mm
+    )
+
+    conn = None
+    uploaded_storage_paths = []
+    persisted_images_meta = []
+
+    try:
+        conn = get_connection()
+        
+        # 1. Create single scan row
+        scan_id = create_scan(
+            conn,
+            product_id=None,
+            user_id=None,
+            image_url=None,  # scans.image_url remains NULL
+            overall_verdict=compliance_results.get("status"),
+            font_height_detected=detected_font_height_mm,
+            org=None
+        )
+
+        # 2. Upload each image to Supabase Storage & insert into images table
+        for item in image_payloads:
+            img_type = item["image_type"]
+            ext = "png"
+            if item["filename"] and "." in item["filename"]:
+                ext = item["filename"].rsplit(".", 1)[-1].lower()
+            elif item["content_type"]:
+                if "jpeg" in item["content_type"] or "jpg" in item["content_type"]:
+                    ext = "jpg"
+
+            storage_path = f"scan-{scan_id}/{img_type}.{ext}"
+            content_type = item["content_type"] or f"image/{ext}"
+
+            upload_image(
+                image_bytes=item["file_bytes"],
+                storage_path=storage_path,
+                content_type=content_type
+            )
+            uploaded_storage_paths.append(storage_path)
+
+            img_id = create_image(
+                conn,
+                scan_id=scan_id,
+                image_url=storage_path,
+                image_type=img_type
+            )
+
+            persisted_images_meta.append({
+                "image_id": img_id,
+                "image_type": img_type,
+                "image_url": storage_path
+            })
+
+        # 3. Create scan_results records once for the scan
+        for result in compliance_results.get("results", []):
+            create_scan_result(
+                conn,
+                scan_id=scan_id,
+                rule_code=result["rule"],
+                status=result["status"],
+                finding_detail=result.get("reason")
+            )
+
+        conn.commit()
+
+    except Exception as e:
+        if conn:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+
+        # Cleanup all uploaded storage objects if DB transaction fails
+        for path in uploaded_storage_paths:
+            try:
+                delete_image(path)
+            except Exception as cleanup_err:
+                print(f"Cleanup Error: Failed to remove {path}: {cleanup_err}")
+
+        raise HTTPException(status_code=500, detail=f"Multi-image scan transaction failed: {str(e)}")
+    finally:
+        if conn:
+            conn.close()
+
+    response_payload = {
+        "status": "success",
+        "scan_id": scan_id,
+        "detected_raw_lines": combined_raw_lines,
+        "compliance_report": compliance_results,
+        "images": persisted_images_meta
+    }
+
+    latest_report_cache = response_payload
     return response_payload
 
 @app.get("/api/export-pdf")

@@ -4,3 +4,4 @@ python-multipart
 pytesseract
 Pillow
 fpdf2
+supabase

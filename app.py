@@ -10,7 +10,8 @@ from database import get_connection
 from crud import (
     create_scan, create_scan_result, create_image,
     get_scan, get_scan_results_for_scan, get_images_for_scan,
-    get_paginated_scans, get_product, get_paginated_scans_for_product
+    get_paginated_scans, get_product, get_paginated_scans_for_product,
+    get_dashboard_stats
 )
 from storage import upload_image, delete_image
 
@@ -963,6 +964,40 @@ def get_product_history(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to retrieve product scan history: {str(e)}")
+    finally:
+        if conn:
+            conn.close()
+
+@app.get("/api/stats")
+def get_stats(
+    start_date: str | None = Query(None),
+    end_date: str | None = Query(None)
+):
+    """
+    Retrieves aggregated compliance statistics and failed rule breakdown from PostgreSQL.
+    Independent of in-memory latest_report_cache. Supports optional start_date and end_date filtering.
+    """
+    parsed_start_date = None
+    if start_date is not None and start_date.strip():
+        parsed_start_date = parse_filter_date(start_date, is_end_date=False)
+
+    parsed_end_date = None
+    if end_date is not None and end_date.strip():
+        parsed_end_date = parse_filter_date(end_date, is_end_date=True)
+
+    conn = None
+    try:
+        conn = get_connection()
+        stats_data = get_dashboard_stats(
+            conn,
+            start_date=parsed_start_date,
+            end_date=parsed_end_date
+        )
+        return stats_data
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to calculate dashboard statistics: {str(e)}")
     finally:
         if conn:
             conn.close()

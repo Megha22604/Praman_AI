@@ -383,3 +383,91 @@ def get_paginated_scans_for_product(conn, product_id: int, page: int = 1, page_s
             "total": total,
             "total_pages": total_pages
         }
+
+
+def get_dashboard_stats(conn, start_date=None, end_date=None):
+    """
+    Calculates aggregated scan compliance statistics and failed rule breakdown from PostgreSQL scans and scan_results tables.
+    Supports optional start_date and end_date filtering.
+    """
+    scans_where = []
+    scans_params = []
+
+    if start_date:
+        scans_where.append("s.timestamp >= %s")
+        scans_params.append(start_date)
+
+    if end_date:
+        scans_where.append("s.timestamp <= %s")
+        scans_params.append(end_date)
+
+    where_sql = ""
+    if scans_where:
+        where_sql = "WHERE " + " AND ".join(scans_where)
+
+    with conn.cursor() as cur:
+        # 1. Total scans and verdict breakdown query
+        query_verdicts = f"""
+        SELECT
+            COUNT(*) AS total_scans,
+            COUNT(*) FILTER (WHERE s.overall_verdict = 'PASS') AS pass_count,
+            COUNT(*) FILTER (WHERE s.overall_verdict = 'FAIL') AS fail_count,
+            COUNT(*) FILTER (WHERE s.overall_verdict = 'NEEDS REVIEW') AS needs_review_count
+        FROM scans s
+        {where_sql};
+        """
+        cur.execute(query_verdicts, tuple(scans_params))
+        row = cur.fetchone()
+
+        if isinstance(row, dict):
+            total_scans = int(row["total_scans"] or 0)
+            pass_count = int(row["pass_count"] or 0)
+            fail_count = int(row["fail_count"] or 0)
+            needs_review_count = int(row["needs_review_count"] or 0)
+        else:
+            total_scans = int(row[0] or 0)
+            pass_count = int(row[1] or 0)
+            fail_count = int(row[2] or 0)
+            needs_review_count = int(row[3] or 0)
+
+        compliance_percentage = round((pass_count / total_scans * 100.0), 2) if total_scans > 0 else 0.0
+
+        # 2. Failed rule counts breakdown query
+        sr_where = ["sr.status = 'FAIL'"]
+        sr_params = []
+        if start_date:
+            sr_where.append("s.timestamp >= %s")
+            sr_params.append(start_date)
+        if end_date:
+            sr_where.append("s.timestamp <= %s")
+            sr_params.append(end_date)
+
+        sr_where_sql = "WHERE " + " AND ".join(sr_where)
+
+        query_failed_rules = f"""
+        SELECT sr.rule_code, COUNT(sr.result_id) AS cnt
+        FROM scan_results sr
+        JOIN scans s ON sr.scan_id = s.scan_id
+        {sr_where_sql}
+        GROUP BY sr.rule_code
+        ORDER BY cnt DESC, sr.rule_code ASC;
+        """
+        cur.execute(query_failed_rules, tuple(sr_params))
+        failed_rows = cur.fetchall()
+
+        failed_rule_counts = {}
+        if failed_rows:
+            for fr in failed_rows:
+                if isinstance(fr, dict):
+                    failed_rule_counts[fr["rule_code"]] = int(fr["cnt"])
+                else:
+                    failed_rule_counts[fr[0]] = int(fr[1])
+
+        return {
+            "total_scans": total_scans,
+            "pass_count": pass_count,
+            "fail_count": fail_count,
+            "needs_review_count": needs_review_count,
+            "compliance_percentage": compliance_percentage,
+            "failed_rule_counts": failed_rule_counts
+        }

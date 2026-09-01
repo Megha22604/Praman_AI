@@ -1,5 +1,5 @@
 import io
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Query
 from fastapi.responses import HTMLResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -7,7 +7,7 @@ from ocr_engine import extract_text_lines_from_image
 from rules_engine import evaluate_all_rules
 from report_generator import generate_pdf_report
 from database import get_connection
-from crud import create_scan, create_scan_result, create_image, get_scan, get_scan_results_for_scan, get_images_for_scan
+from crud import create_scan, create_scan_result, create_image, get_scan, get_scan_results_for_scan, get_images_for_scan, get_paginated_scans
 from storage import upload_image, delete_image
 
 app = FastAPI(
@@ -674,6 +674,137 @@ async def scan_package_images(
 
     latest_report_cache = response_payload
     return response_payload
+
+def parse_filter_date(date_str: str, is_end_date: bool = False):
+    d_str = date_str.strip()
+    from datetime import datetime
+    try:
+        if "T" in d_str or " " in d_str:
+            d_str_iso = d_str.replace(" ", "T")
+            return datetime.fromisoformat(d_str_iso)
+        dt = datetime.strptime(d_str, "%Y-%m-%d")
+        if is_end_date:
+            return dt.replace(hour=23, minute=59, second=59, microsecond=999999)
+        return dt
+    except Exception:
+        target = "end_date" if is_end_date else "start_date"
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid {target} format '{date_str}'. Expected ISO 8601 string or YYYY-MM-DD format."
+        )
+
+
+@app.get("/api/scans")
+def get_scans(
+    page: int = Query(1),
+    page_size: int = Query(10),
+    status: str | None = Query(None),
+    failed_rule: str | None = Query(None),
+    start_date: str | None = Query(None),
+    end_date: str | None = Query(None),
+    product_name: str | None = Query(None),
+    brand: str | None = Query(None),
+    inspector: str | None = Query(None)
+):
+    """
+    Retrieves paginated scan history records from PostgreSQL ordered newest-first
+    (timestamp DESC, scan_id DESC) with optional search & filtering parameters.
+    Independent of in-memory latest_report_cache.
+    """
+    MAX_PAGE_SIZE = 100
+    ALLOWED_STATUSES = {"PASS", "FAIL", "NEEDS REVIEW"}
+
+    if page < 1:
+        raise HTTPException(status_code=400, detail="page must be greater than or equal to 1.")
+
+    if page_size < 1:
+        raise HTTPException(status_code=400, detail="page_size must be greater than or equal to 1.")
+
+    if page_size > MAX_PAGE_SIZE:
+        raise HTTPException(status_code=400, detail=f"page_size cannot exceed maximum allowed limit of {MAX_PAGE_SIZE}.")
+
+    norm_status = None
+    if status is not None and status.strip():
+        norm_status = status.strip().upper()
+        if norm_status not in ALLOWED_STATUSES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid status filter '{status}'. Allowed values: 'PASS', 'FAIL', 'NEEDS REVIEW'."
+            )
+
+    parsed_start_date = None
+    if start_date is not None and start_date.strip():
+        parsed_start_date = parse_filter_date(start_date, is_end_date=False)
+
+    parsed_end_date = None
+    if end_date is not None and end_date.strip():
+        parsed_end_date = parse_filter_date(end_date, is_end_date=True)
+
+    norm_failed_rule = None
+    if failed_rule is not None and failed_rule.strip():
+        norm_failed_rule = failed_rule.strip()
+
+    conn = None
+    try:
+        conn = get_connection()
+        res_data = get_paginated_scans(
+            conn,
+            page=page,
+            page_size=page_size,
+            status=norm_status,
+            failed_rule=norm_failed_rule,
+            start_date=parsed_start_date,
+            end_date=parsed_end_date,
+            product_name=product_name,
+            brand=brand,
+            inspector=inspector
+        )
+
+        formatted_items = []
+        for item in res_data.get("items", []):
+            ocr_data = item.get("ocr_raw_text")
+            raw_lines = []
+            if ocr_data is not None:
+                if isinstance(ocr_data, list):
+                    raw_lines = ocr_data
+                elif isinstance(ocr_data, str):
+                    import json
+                    try:
+                        raw_lines = json.loads(ocr_data)
+                    except Exception:
+                        raw_lines = [ocr_data]
+
+            font_height = item.get("font_height_detected")
+            if font_height is not None:
+                font_height = float(font_height)
+
+            formatted_items.append({
+                "scan_id": item["scan_id"],
+                "timestamp": item["timestamp"],
+                "overall_verdict": item["overall_verdict"],
+                "font_height_detected": font_height,
+                "ocr": {
+                    "raw_lines": raw_lines
+                },
+                "product_id": item.get("product_id"),
+                "user_id": item.get("user_id"),
+                "org": item.get("org")
+            })
+
+        return {
+            "items": formatted_items,
+            "page": res_data["page"],
+            "page_size": res_data["page_size"],
+            "total": res_data["total"],
+            "total_pages": res_data["total_pages"]
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve scan history: {str(e)}")
+    finally:
+        if conn:
+            conn.close()
 
 @app.get("/api/scans/{scan_id}")
 def get_scan_by_id(scan_id: int):

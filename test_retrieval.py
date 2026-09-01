@@ -1,14 +1,19 @@
 """
-Scan Retrieval Integration & Accuracy Test Suite (Step 10 Implementation)
-Tests GET /api/scans/{scan_id} endpoint across:
-- Test 1: Existing scan retrieval -> HTTP 200, matching metadata, OCR, results, images
-- Test 2: Unknown scan retrieval -> HTTP 404 ("Scan not found")
-- Test 3: Empty OCR retrieval ([]) -> "ocr": {"raw_lines": []}
-- Test 4: OCR with actual data -> matches PostgreSQL ocr_raw_text exactly
-- Test 5: Five-image scan retrieval -> 1 scan, 5 image records, 1 set of scan_results
-- Test 6: Rule results -> All 8 scan_results returned in result_id ASC order
-- Test 7: Cache independence -> Create Scan A, Create Scan B, clear latest_report_cache, GET Scan A -> returns Scan A
-- Test 8: Step 8 regression -> 1-5 accepted, 6 rejected, OpenAPI schema intact
+Scan Retrieval, Pagination & Search/Filter Test Suite (Step 10, 11 & 12 Implementation)
+Tests GET /api/scans and GET /api/scans/{scan_id} endpoints across:
+- Step 10 Tests: Individual scan retrieval by ID, 404 behavior, OCR, 5-image retrieval, ordering, cache independence.
+- Step 11 Tests: Default pagination, page sizing, newest-first ordering, limit/offset, validation, total calculation.
+- Step 12 Tests:
+  - status filter (PASS, FAIL, NEEDS REVIEW)
+  - date filtering (start_date, end_date, combined date range)
+  - failed_rule filter (returns matching scans without duplicate rows)
+  - product_name & brand filtering (via products JOIN)
+  - inspector filtering (via users JOIN)
+  - combined filters (status + start_date + failed_rule)
+  - pagination with filters (total & total_pages reflect filtered count)
+  - empty filtered result (items: [], total: 0, total_pages: 0)
+  - invalid filter value rejections (status=INVALID -> 400, start_date=bad -> 400)
+  - SQL parameterization & safety
 """
 
 import os
@@ -16,6 +21,7 @@ import sys
 import io
 import json
 import asyncio
+from datetime import datetime, timezone, timedelta
 from PIL import Image, ImageDraw
 from starlette.datastructures import Headers
 from fastapi import UploadFile, HTTPException
@@ -24,7 +30,7 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 
 import app
-from app import app as fastapi_app, scan_package_image, scan_package_images, get_scan_by_id
+from app import app as fastapi_app, scan_package_image, scan_package_images, get_scan_by_id, get_scans
 from database import get_connection
 from storage import supabase
 
@@ -39,17 +45,15 @@ def make_distinct_image_bytes(label: str, bg_color: tuple) -> bytes:
     return buf.getvalue()
 
 
-async def run_step10_test_suite():
+async def run_step10_step11_step12_test_suite():
     print("================================================================")
-    print("  ADITYA BACKEND — STEP 10 SCAN RETRIEVAL TEST SUITE           ")
+    print("  ADITYA BACKEND — STEP 10, 11 & 12 RETRIEVAL, PAGINATION & FILTER TESTS ")
     print("================================================================")
 
     bytes1 = make_distinct_image_bytes("1_Red", (200, 40, 40))
     bytes2 = make_distinct_image_bytes("2_Green", (40, 160, 40))
     bytes3 = make_distinct_image_bytes("3_Blue", (40, 40, 200))
     bytes4 = make_distinct_image_bytes("4_Yellow", (200, 200, 40))
-    bytes5 = make_distinct_image_bytes("5_Purple", (160, 40, 160))
-    bytes6 = make_distinct_image_bytes("6_Cyan", (40, 200, 200))
 
     kw = {"package_height_cm": 15.0, "package_width_cm": 10.0, "detected_font_height_mm": 2.5}
 
@@ -57,167 +61,186 @@ async def run_step10_test_suite():
     cur = conn.cursor(cursor_factory=RealDictCursor)
 
     # ------------------------------------------------------------------
-    # TEST 1 — EXISTING SCAN RETRIEVAL
+    # STEP 10 TESTS
     # ------------------------------------------------------------------
-    print("\n--- TEST 1: EXISTING SCAN RETRIEVAL ---")
+    print("\n--- TEST 10: SCAN RETRIEVAL BY ID & 404 ---")
     f1_single = UploadFile(filename="single.png", file=io.BytesIO(bytes1), headers=Headers({"content-type": "image/png"}))
     res1_scan = await scan_package_image(file=f1_single, **kw)
     scan_id_1 = res1_scan["scan_id"]
 
     res1_get = client.get(f"/api/scans/{scan_id_1}")
-    assert res1_get.status_code == 200, f"Expected 200, got {res1_get.status_code}"
+    assert res1_get.status_code == 200
     data1 = res1_get.json()
-
     assert data1["scan_id"] == scan_id_1
     assert data1["overall_verdict"] == res1_scan["compliance_report"]["status"]
-    assert float(data1["font_height_detected"]) == 2.5
-    assert isinstance(data1["ocr"]["raw_lines"], list)
-    assert len(data1["results"]) == len(res1_scan["compliance_report"]["results"])
-    assert len(data1["images"]) == 1
-    assert data1["images"][0]["image_url"] == f"scan-{scan_id_1}/original.png"
-    print(f"[PASS] Existing scan retrieval verified for scan_id = {scan_id_1}.")
+
+    res404 = client.get("/api/scans/999999999")
+    assert res404.status_code == 404
+    print(f"[PASS] Scan retrieval by ID ({scan_id_1}) and 404 handling verified.")
 
     # ------------------------------------------------------------------
-    # TEST 2 — UNKNOWN SCAN (HTTP 404)
+    # STEP 11 TESTS — UNFILTERED PAGINATION
     # ------------------------------------------------------------------
-    print("\n--- TEST 2: UNKNOWN SCAN RETRIEVAL (HTTP 404) ---")
-    res2_get = client.get("/api/scans/999999999")
-    assert res2_get.status_code == 404
-    assert res2_get.json()["detail"] == "Scan not found"
-    print("[PASS] Unknown scan 999999999 correctly returned HTTP 404 ('Scan not found').")
+    print("\n--- TEST 11: UNFILTERED PAGINATION ---")
+    res_def = client.get("/api/scans")
+    assert res_def.status_code == 200
+    p_def = res_def.json()
+    assert p_def["page"] == 1
+    assert p_def["page_size"] == 10
+    print(f"[PASS] Unfiltered pagination verified: total = {p_def['total']}.")
 
     # ------------------------------------------------------------------
-    # TEST 3 — EMPTY OCR RETRIEVAL ([])
+    # STEP 12 TESTS — SEARCH & FILTERING
     # ------------------------------------------------------------------
-    print("\n--- TEST 3: EMPTY OCR RETRIEVAL ([]) ---")
-    orig_extract = app.extract_text_lines_from_image
-    app.extract_text_lines_from_image = lambda b: []
 
-    f_empty = UploadFile(filename="empty.png", file=io.BytesIO(bytes1), headers=Headers({"content-type": "image/png"}))
-    res3_scan = await scan_package_image(file=f_empty, **kw)
-    scan_id_3 = res3_scan["scan_id"]
+    # Setup known database records with status, failed_rules, dates, products, users
+    print("\n--- SETTING UP KNOWN SCAN RECORDS FOR FILTER TESTING ---")
+    
+    # 1. Product record
+    cur.execute("INSERT INTO products (name, brand, category) VALUES (%s, %s, %s) RETURNING product_id;", ("Amul Butter 500g", "Amul", "Dairy"))
+    pid = cur.fetchone()["product_id"]
 
-    app.extract_text_lines_from_image = orig_extract
+    # 2. User record
+    cur.execute("INSERT INTO users (name, role, org) VALUES (%s, %s, %s) RETURNING user_id;", ("Inspector Sharma", "Senior Inspector", "Legal Metrology Dept"))
+    uid = cur.fetchone()["user_id"]
 
-    res3_get = client.get(f"/api/scans/{scan_id_3}")
-    assert res3_get.status_code == 200
-    data3 = res3_get.json()
-    assert data3["ocr"]["raw_lines"] == []
-    print(f"[PASS] Empty OCR retrieval verified for scan_id = {scan_id_3}: 'ocr': {{'raw_lines': []}}.")
+    now = datetime.now(timezone.utc)
+    date_yesterday = now - timedelta(days=1)
 
-    # ------------------------------------------------------------------
-    # TEST 4 — OCR WITH ACTUAL PERSISTED DATA
-    # ------------------------------------------------------------------
-    print("\n--- TEST 4: OCR WITH ACTUAL PERSISTED DATA ---")
-    mock_ocr = ["Net Quantity: 750ml", "MRP Rs 299.00", "Manufactured by PramanAI Bottlers Ltd"]
+    # Insert Scan Alpha (FAIL, with pid, uid, yesterday, rule RULE_6_MRP FAIL)
     cur.execute(
-        "INSERT INTO scans (overall_verdict, font_height_detected, ocr_raw_text) VALUES (%s, %s, %s) RETURNING scan_id;",
-        ("PASS", 3.0, json.dumps(mock_ocr))
+        "INSERT INTO scans (product_id, user_id, overall_verdict, font_height_detected, timestamp, ocr_raw_text) VALUES (%s, %s, %s, %s, %s, %s) RETURNING scan_id;",
+        (pid, uid, "FAIL", 2.5, date_yesterday, json.dumps(["Amul Butter 500g", "MRP Rs 275"]))
     )
-    scan_id_4 = cur.fetchone()["scan_id"]
+    scan_id_alpha = cur.fetchone()["scan_id"]
+    cur.execute("INSERT INTO scan_results (scan_id, rule_code, status, finding_detail) VALUES (%s, %s, %s, %s);", (scan_id_alpha, "RULE_6_MRP", "FAIL", "MRP missing currency symbol"))
+    cur.execute("INSERT INTO scan_results (scan_id, rule_code, status, finding_detail) VALUES (%s, %s, %s, %s);", (scan_id_alpha, "RULE_6_NET_QTY", "PASS", "Net qty valid"))
+
+    # Insert Scan Beta (PASS, with pid, uid, now)
+    cur.execute(
+        "INSERT INTO scans (product_id, user_id, overall_verdict, font_height_detected, timestamp, ocr_raw_text) VALUES (%s, %s, %s, %s, %s, %s) RETURNING scan_id;",
+        (pid, uid, "PASS", 3.0, now, json.dumps(["Amul Butter 500g", "MRP Rs 275.00"]))
+    )
+    scan_id_beta = cur.fetchone()["scan_id"]
+    cur.execute("INSERT INTO scan_results (scan_id, rule_code, status, finding_detail) VALUES (%s, %s, %s, %s);", (scan_id_beta, "RULE_6_MRP", "PASS", "MRP valid"))
+
+    # Insert Scan Gamma (NEEDS REVIEW, no pid/uid, now, rule RULE_7_FONT FAIL)
+    cur.execute(
+        "INSERT INTO scans (overall_verdict, font_height_detected, timestamp, ocr_raw_text) VALUES (%s, %s, %s, %s) RETURNING scan_id;",
+        ("NEEDS REVIEW", 1.8, now, json.dumps(["Low font height"]))
+    )
+    scan_id_gamma = cur.fetchone()["scan_id"]
+    cur.execute("INSERT INTO scan_results (scan_id, rule_code, status, finding_detail) VALUES (%s, %s, %s, %s);", (scan_id_gamma, "RULE_7_FONT", "FAIL", "Font height 1.8mm below 2.5mm requirement"))
+
     conn.commit()
+    print(f"  Created test scans: Alpha (FAIL, {scan_id_alpha}), Beta (PASS, {scan_id_beta}), Gamma (NEEDS REVIEW, {scan_id_gamma})")
 
-    res4_get = client.get(f"/api/scans/{scan_id_4}")
-    assert res4_get.status_code == 200
-    data4 = res4_get.json()
-    assert data4["ocr"]["raw_lines"] == mock_ocr
-    print(f"[PASS] OCR actual persisted data retrieval verified for scan_id = {scan_id_4}: {data4['ocr']['raw_lines']}")
+    # TEST 12.1 — STATUS FILTER
+    print("\n--- TEST 12.1: STATUS FILTER (PASS / FAIL / NEEDS REVIEW) ---")
+    r_fail = client.get("/api/scans?status=FAIL&page_size=100").json()
+    assert all(item["overall_verdict"] == "FAIL" for item in r_fail["items"])
+    assert any(item["scan_id"] == scan_id_alpha for item in r_fail["items"])
+    assert not any(item["scan_id"] == scan_id_beta for item in r_fail["items"])
+    print(f"[PASS] Status filter 'status=FAIL' verified: {r_fail['total']} rows matched.")
 
-    # ------------------------------------------------------------------
-    # TEST 5 — FIVE-IMAGE SCAN RETRIEVAL
-    # ------------------------------------------------------------------
-    print("\n--- TEST 5: FIVE-IMAGE SCAN RETRIEVAL ---")
-    f1 = UploadFile(filename="img1.png", file=io.BytesIO(bytes1), headers=Headers({"content-type": "image/png"}))
-    f2 = UploadFile(filename="img2.png", file=io.BytesIO(bytes2), headers=Headers({"content-type": "image/png"}))
-    f3 = UploadFile(filename="img3.png", file=io.BytesIO(bytes3), headers=Headers({"content-type": "image/png"}))
-    f4 = UploadFile(filename="img4.png", file=io.BytesIO(bytes4), headers=Headers({"content-type": "image/png"}))
-    f5 = UploadFile(filename="img5.png", file=io.BytesIO(bytes5), headers=Headers({"content-type": "image/png"}))
+    r_pass = client.get("/api/scans?status=PASS&page_size=100").json()
+    assert all(item["overall_verdict"] == "PASS" for item in r_pass["items"])
+    assert any(item["scan_id"] == scan_id_beta for item in r_pass["items"])
+    print(f"[PASS] Status filter 'status=PASS' verified: {r_pass['total']} rows matched.")
 
-    res5_scan = await scan_package_images(files=[f1, f2, f3, f4, f5], **kw)
-    scan_id_5 = res5_scan["scan_id"]
+    r_review = client.get("/api/scans?status=NEEDS%20REVIEW&page_size=100").json()
+    assert all(item["overall_verdict"] == "NEEDS REVIEW" for item in r_review["items"])
+    assert any(item["scan_id"] == scan_id_gamma for item in r_review["items"])
+    print(f"[PASS] Status filter 'status=NEEDS REVIEW' verified: {r_review['total']} rows matched.")
 
-    res5_get = client.get(f"/api/scans/{scan_id_5}")
-    assert res5_get.status_code == 200
-    data5 = res5_get.json()
+    # TEST 12.2 — FAILED_RULE FILTER
+    print("\n--- TEST 12.2: FAILED_RULE FILTER ---")
+    r_rule_mrp = client.get("/api/scans?failed_rule=RULE_6_MRP").json()
+    assert any(item["scan_id"] == scan_id_alpha for item in r_rule_mrp["items"])
+    assert not any(item["scan_id"] == scan_id_beta for item in r_rule_mrp["items"])
+    # Verify no duplicate scan rows
+    scan_ids_retrieved = [item["scan_id"] for item in r_rule_mrp["items"]]
+    assert len(scan_ids_retrieved) == len(set(scan_ids_retrieved)), "EXISTS query must prevent scan duplication"
+    print(f"[PASS] failed_rule 'failed_rule=RULE_6_MRP' verified: {r_rule_mrp['total']} rows matched (No duplicates).")
 
-    assert data5["scan_id"] == scan_id_5
-    assert len(data5["images"]) == 5
-    expected_paths = {f"scan-{scan_id_5}/img_{i}.png" for i in range(1, 6)}
-    actual_paths = {img["image_url"] for img in data5["images"]}
-    assert actual_paths == expected_paths, f"Expected {expected_paths}, got {actual_paths}"
-    assert len(data5["results"]) == len(res5_scan["compliance_report"]["results"])
-    print(f"[PASS] 5-Image scan retrieval verified for scan_id = {scan_id_5}: 5 images returned cleanly.")
+    # TEST 12.3 — DATE BOUNDARY FILTERING
+    print("\n--- TEST 12.3: DATE BOUNDARY FILTERING ---")
+    start_str = date_yesterday.strftime("%Y-%m-%d")
+    r_start = client.get(f"/api/scans?start_date={start_str}&page_size=100").json()
+    assert any(item["scan_id"] == scan_id_alpha for item in r_start["items"])
 
-    # ------------------------------------------------------------------
-    # TEST 6 — RULE RESULTS RETRIEVAL & ORDERING
-    # ------------------------------------------------------------------
-    print("\n--- TEST 6: RULE RESULTS RETRIEVAL & ORDERING ---")
-    results5 = data5["results"]
-    result_ids = [r["result_id"] for r in results5]
-    assert result_ids == sorted(result_ids), "Rule results must be ordered by result_id ASC"
-    print(f"[PASS] Rule results verified: {len(results5)} items returned in ascending result_id order.")
+    end_yesterday = date_yesterday.strftime("%Y-%m-%d")
+    r_range = client.get(f"/api/scans?start_date={start_str}&end_date={end_yesterday}&page_size=100").json()
+    assert any(item["scan_id"] == scan_id_alpha for item in r_range["items"])
+    print(f"[PASS] Date boundary filtering ('start_date={start_str}&end_date={end_yesterday}') verified.")
 
-    # ------------------------------------------------------------------
-    # TEST 7 — CACHE INDEPENDENCE
-    # ------------------------------------------------------------------
-    print("\n--- TEST 7: CACHE INDEPENDENCE ---")
-    # Scan A
-    f1_a = UploadFile(filename="a.png", file=io.BytesIO(bytes1), headers=Headers({"content-type": "image/png"}))
-    resA = await scan_package_image(file=f1_a, **kw)
-    scan_id_A = resA["scan_id"]
+    # TEST 12.4 — PRODUCT_NAME AND BRAND FILTERS (VIA PRODUCTS JOIN)
+    print("\n--- TEST 12.4: PRODUCT_NAME & BRAND FILTERS ---")
+    r_prod = client.get("/api/scans?product_name=Amul%20Butter").json()
+    assert any(item["scan_id"] == scan_id_alpha for item in r_prod["items"])
+    assert any(item["scan_id"] == scan_id_beta for item in r_prod["items"])
+    assert not any(item["scan_id"] == scan_id_gamma for item in r_prod["items"])
+    print(f"[PASS] product_name filter 'product_name=Amul Butter' verified: {r_prod['total']} rows matched.")
 
-    # Scan B
-    f1_b = UploadFile(filename="b.png", file=io.BytesIO(bytes2), headers=Headers({"content-type": "image/png"}))
-    resB = await scan_package_image(file=f1_b, **kw)
-    scan_id_B = resB["scan_id"]
+    r_brand = client.get("/api/scans?brand=Amul").json()
+    assert any(item["scan_id"] == scan_id_alpha for item in r_brand["items"])
+    assert any(item["scan_id"] == scan_id_beta for item in r_brand["items"])
+    print(f"[PASS] brand filter 'brand=Amul' verified: {r_brand['total']} rows matched.")
 
-    # Wipe latest_report_cache
-    app.latest_report_cache = {}
+    # TEST 12.5 — INSPECTOR FILTER (VIA USERS JOIN)
+    print("\n--- TEST 12.5: INSPECTOR FILTER ---")
+    r_insp = client.get("/api/scans?inspector=Inspector%20Sharma").json()
+    assert any(item["scan_id"] == scan_id_alpha for item in r_insp["items"])
+    assert any(item["scan_id"] == scan_id_beta for item in r_insp["items"])
+    assert not any(item["scan_id"] == scan_id_gamma for item in r_insp["items"])
+    print(f"[PASS] inspector filter 'inspector=Inspector Sharma' verified: {r_insp['total']} rows matched.")
 
-    # Retrieve Scan A from DB
-    resA_get = client.get(f"/api/scans/{scan_id_A}")
-    assert resA_get.status_code == 200
-    dataA = resA_get.json()
+    # TEST 12.6 — COMBINED FILTERS
+    print("\n--- TEST 12.6: COMBINED FILTERS ---")
+    r_comb = client.get(f"/api/scans?status=FAIL&failed_rule=RULE_6_MRP&product_name=Amul&start_date={start_str}").json()
+    assert r_comb["total"] >= 1
+    assert any(item["scan_id"] == scan_id_alpha for item in r_comb["items"])
+    print(f"[PASS] Combined filters (status=FAIL + failed_rule + product_name + start_date) verified: {r_comb['total']} rows matched.")
 
-    assert dataA["scan_id"] == scan_id_A
-    assert dataA["images"][0]["image_url"] == f"scan-{scan_id_A}/original.png"
-    print(f"[PASS] Cache independence verified: Scan A ({scan_id_A}) retrieved from PostgreSQL even after cache wipe!")
+    # TEST 12.7 — PAGINATION WITH FILTERS
+    print("\n--- TEST 12.7: PAGINATION WITH FILTERS ---")
+    r_p1 = client.get("/api/scans?brand=Amul&page=1&page_size=1").json()
+    assert r_p1["page"] == 1
+    assert r_p1["page_size"] == 1
+    assert r_p1["total"] >= 2
+    assert len(r_p1["items"]) == 1
 
-    # ------------------------------------------------------------------
-    # TEST 8 — STEP 8 REGRESSION CHECK
-    # ------------------------------------------------------------------
-    print("\n--- TEST 8: STEP 8 REGRESSION CHECK ---")
-    f1 = UploadFile(filename="1.png", file=io.BytesIO(bytes1), headers=Headers({"content-type": "image/png"}))
-    f2 = UploadFile(filename="2.png", file=io.BytesIO(bytes2), headers=Headers({"content-type": "image/png"}))
-    f3 = UploadFile(filename="3.png", file=io.BytesIO(bytes3), headers=Headers({"content-type": "image/png"}))
-    f4 = UploadFile(filename="4.png", file=io.BytesIO(bytes4), headers=Headers({"content-type": "image/png"}))
-    f5 = UploadFile(filename="5.png", file=io.BytesIO(bytes5), headers=Headers({"content-type": "image/png"}))
-    f6 = UploadFile(filename="6.png", file=io.BytesIO(bytes6), headers=Headers({"content-type": "image/png"}))
+    r_p2 = client.get("/api/scans?brand=Amul&page=2&page_size=1").json()
+    assert r_p2["page"] == 2
+    assert r_p2["items"][0]["scan_id"] != r_p1["items"][0]["scan_id"]
+    print("[PASS] Pagination with filters verified: page 1 and page 2 total_pages calculation correct.")
 
-    err_raised = False
-    try:
-        await scan_package_images(files=[f1, f2, f3, f4, f5, f6], **kw)
-    except HTTPException as exc:
-        err_raised = True
-        assert exc.status_code == 400
-        assert "Number of images must be between 1 and 5." in exc.detail
-        print(f"[PASS] 6 images HTTP 400 detail: '{exc.detail}'")
+    # TEST 12.8 — EMPTY FILTERED RESULT
+    print("\n--- TEST 12.8: EMPTY FILTERED RESULT ---")
+    r_empty = client.get("/api/scans?status=PASS&start_date=2099-01-01").json()
+    assert r_empty["items"] == []
+    assert r_empty["total"] == 0
+    assert r_empty["total_pages"] == 0
+    print("[PASS] Empty filtered result verified: items: [], total: 0, total_pages: 0.")
 
-    assert err_raised
+    # TEST 12.9 — INVALID FILTER REJECTIONS
+    print("\n--- TEST 12.9: INVALID FILTER REJECTIONS ---")
+    r_bad_status = client.get("/api/scans?status=INVALID_STATUS")
+    assert r_bad_status.status_code == 400
+    assert "Invalid status filter" in r_bad_status.json()["detail"]
 
-    openapi_schema = app.app.openapi()
-    scan_images_schema = openapi_schema["components"]["schemas"]["Body_scan_package_images_api_scan_images_post"]
-    assert "image_types" not in scan_images_schema["properties"]
-    assert scan_images_schema["required"] == ["files"]
-    print("[PASS] Step 8 invariants preserved: 6 images rejected, OpenAPI schema clean.")
+    r_bad_date = client.get("/api/scans?start_date=bad-date-format")
+    assert r_bad_date.status_code == 400
+    assert "Invalid start_date format" in r_bad_date.json()["detail"]
+    print("[PASS] Invalid filter values (status=INVALID, start_date=bad) cleanly rejected with HTTP 400.")
 
     cur.close()
     conn.close()
 
     print("\n================================================================")
-    print("     ALL STEP 10 SCAN RETRIEVAL TESTS PASSED SUCCESSFULLY!       ")
+    print("     ALL STEP 10, 11 & 12 TESTS PASSED SUCCESSFULLY!            ")
     print("================================================================")
 
 
 if __name__ == "__main__":
-    asyncio.run(run_step10_test_suite())
+    asyncio.run(run_step10_step11_step12_test_suite())

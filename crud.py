@@ -5,6 +5,7 @@ Functions accept an active psycopg2 connection and do not manage transactions in
 """
 
 import json
+import math
 
 def create_scan(
     conn,
@@ -183,3 +184,130 @@ def get_images_for_scan(conn, scan_id):
             return rows
         columns = [desc[0] for desc in cur.description]
         return [dict(zip(columns, row)) for row in rows]
+
+
+def get_paginated_scans(
+    conn,
+    page: int = 1,
+    page_size: int = 10,
+    status: str | None = None,
+    failed_rule: str | None = None,
+    start_date=None,
+    end_date=None,
+    product_name: str | None = None,
+    brand: str | None = None,
+    inspector: str | None = None
+):
+    """
+    Fetches paginated scan records ordered by timestamp DESC, scan_id DESC with optional filters.
+    Returns a dictionary containing items, page, page_size, total, and total_pages.
+    Uses SQL LIMIT, OFFSET, and parameterized WHERE conditions.
+    """
+    where_clauses = []
+    params = []
+
+    if status:
+        where_clauses.append("s.overall_verdict = %s")
+        params.append(status)
+
+    if start_date:
+        where_clauses.append("s.timestamp >= %s")
+        params.append(start_date)
+
+    if end_date:
+        where_clauses.append("s.timestamp <= %s")
+        params.append(end_date)
+
+    if failed_rule:
+        where_clauses.append("""
+            EXISTS (
+                SELECT 1 FROM scan_results sr 
+                WHERE sr.scan_id = s.scan_id 
+                AND sr.rule_code = %s 
+                AND sr.status = 'FAIL'
+            )
+        """)
+        params.append(failed_rule)
+
+    if product_name:
+        where_clauses.append("""
+            EXISTS (
+                SELECT 1 FROM products p 
+                WHERE p.product_id = s.product_id 
+                AND p.name ILIKE %s
+            )
+        """)
+        params.append(f"%{product_name.strip()}%")
+
+    if brand:
+        where_clauses.append("""
+            EXISTS (
+                SELECT 1 FROM products p 
+                WHERE p.product_id = s.product_id 
+                AND p.brand ILIKE %s
+            )
+        """)
+        params.append(f"%{brand.strip()}%")
+
+    if inspector:
+        where_clauses.append("""
+            EXISTS (
+                SELECT 1 FROM users u 
+                WHERE u.user_id = s.user_id 
+                AND (u.name ILIKE %s OR CAST(u.user_id AS TEXT) = %s)
+            )
+        """)
+        insp_val = inspector.strip()
+        params.extend([f"%{insp_val}%", insp_val])
+
+    where_sql = ""
+    if where_clauses:
+        where_sql = "WHERE " + " AND ".join(where_clauses)
+
+    offset = (page - 1) * page_size
+
+    with conn.cursor() as cur:
+        # 1. Count query
+        count_query = f"SELECT COUNT(*) FROM scans s {where_sql};"
+        cur.execute(count_query, tuple(params))
+        count_row = cur.fetchone()
+        total = count_row[0] if not isinstance(count_row, dict) else list(count_row.values())[0]
+
+        total_pages = math.ceil(total / page_size) if total > 0 else 0
+
+        # 2. Paginated data query
+        data_query = f"""
+        SELECT
+            s.scan_id,
+            s.product_id,
+            s.user_id,
+            s.image_url,
+            s.timestamp,
+            s.overall_verdict,
+            s.font_height_detected,
+            s.org,
+            s.ocr_raw_text
+        FROM scans s
+        {where_sql}
+        ORDER BY s.timestamp DESC, s.scan_id DESC
+        LIMIT %s OFFSET %s;
+        """
+        data_params = tuple(params) + (page_size, offset)
+        cur.execute(data_query, data_params)
+        rows = cur.fetchall()
+
+        items = []
+        if rows:
+            if isinstance(rows[0], dict):
+                items = rows
+            else:
+                columns = [desc[0] for desc in cur.description]
+                items = [dict(zip(columns, row)) for row in rows]
+
+        return {
+            "items": items,
+            "page": page,
+            "page_size": page_size,
+            "total": total,
+            "total_pages": total_pages
+        }

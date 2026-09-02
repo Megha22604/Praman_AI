@@ -190,7 +190,7 @@ def _deskew_image(gray_img: np.ndarray) -> np.ndarray:
 #  Main preprocessing pipeline
 # ---------------------------------------------------------------------------
 
-def preprocess_image(pil_img: Image.Image) -> np.ndarray:
+def preprocess_image_with_scale(pil_img: Image.Image) -> tuple[np.ndarray, float]:
     """
     Full preprocessing pipeline for OCR:
       1. EXIF orientation correction
@@ -201,6 +201,9 @@ def preprocess_image(pil_img: Image.Image) -> np.ndarray:
       6. Deskew rotation (straighten text lines)
       7. CLAHE adaptive contrast
       8. Bilateral noise filtering
+
+    Returns:
+        tuple[np.ndarray, float]: (preprocessed_grayscale_image, scale_factor)
     """
     # 1. Correct smartphone EXIF orientation
     pil_img = ImageOps.exif_transpose(pil_img)
@@ -213,12 +216,13 @@ def preprocess_image(pil_img: Image.Image) -> np.ndarray:
     max_dim = max(h, w)
     min_dim = min(h, w)
 
-    if max_dim > 2000:
-        scale = 2000.0 / float(max_dim)
-        rgb_img = cv2.resize(rgb_img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+    scale_factor = 1.0
+    if max_dim > 3600:
+        scale_factor = 3600.0 / float(max_dim)
+        rgb_img = cv2.resize(rgb_img, (int(w * scale_factor), int(h * scale_factor)), interpolation=cv2.INTER_AREA)
     elif min_dim < 600:
-        scale = 600.0 / float(min_dim)
-        rgb_img = cv2.resize(rgb_img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_CUBIC)
+        scale_factor = 600.0 / float(min_dim)
+        rgb_img = cv2.resize(rgb_img, (int(w * scale_factor), int(h * scale_factor)), interpolation=cv2.INTER_CUBIC)
 
     # 4. Perspective correction — flatten tilted / trapezoidal labels (operates on RGB)
     try:
@@ -242,7 +246,13 @@ def preprocess_image(pil_img: Image.Image) -> np.ndarray:
     # 8. Gentle bilateral filtering to smooth background noise while keeping text edges crisp
     smoothed = cv2.bilateralFilter(enhanced, d=5, sigmaColor=50, sigmaSpace=50)
 
-    return smoothed
+    return smoothed, scale_factor
+
+
+def preprocess_image(pil_img: Image.Image) -> np.ndarray:
+    """Convenience wrapper returning only the processed image array."""
+    processed, _ = preprocess_image_with_scale(pil_img)
+    return processed
 
 
 def _is_meaningful_line(line: str) -> bool:
@@ -335,4 +345,93 @@ def extract_text_lines_from_image(image_bytes: bytes) -> list[str]:
     """
     Extracts high-accuracy text lines as raw strings (retains full backwards compatibility).
     """
-    return [item["text"] for item in extract_text_lines_with_confidence(image_bytes)]
+    return [item["text"] for item in extract_text_lines_with_confidence(image_bytes)]
+
+
+def measure_font_height_mm(image_bytes: bytes, pixels_per_mm: float) -> dict:
+    """
+    Automatically calculates physical font height (in mm) of packaging text declarations
+    using character bounding boxes from Tesseract and the ArUco calibration scale factor.
+    
+    Pursuant to Legal Metrology Rule 7(2) / Second Schedule, font height is evaluated
+    on uppercase letters (A-Z) and numerals (0-9).
+    
+    Returns:
+        dict: {
+            "success": bool,
+            "measured_font_height_mm": float | None,
+            "min_font_height_mm": float | None,
+            "characters_sampled": int,
+            "message": str
+        }
+    """
+    if not pixels_per_mm or pixels_per_mm <= 0:
+        return {
+            "success": False,
+            "measured_font_height_mm": None,
+            "min_font_height_mm": None,
+            "characters_sampled": 0,
+            "message": "Invalid or missing pixels_per_mm calibration scale."
+        }
+
+    try:
+        pil_image = Image.open(io.BytesIO(image_bytes))
+        processed, scale_factor = preprocess_image_with_scale(pil_image)
+
+        # Adjust scale for any resize applied during preprocessing
+        effective_ppm = pixels_per_mm * scale_factor
+
+        # Extract character-level bounding boxes: [char, left, bottom, right, top, page_num]
+        boxes_raw = pytesseract.image_to_boxes(processed, config=r'--oem 3 --psm 3')
+        if not boxes_raw.strip():
+            boxes_raw = pytesseract.image_to_boxes(processed, config=r'--oem 3 --psm 11')
+
+        char_entries = [line.split() for line in boxes_raw.splitlines() if len(line.split()) >= 6]
+
+        # Filter for Uppercase letters and Numerals per Legal Metrology standards
+        heights_mm = []
+        for entry in char_entries:
+            char = entry[0]
+            if char.isupper() or char.isdigit():
+                try:
+                    bottom = int(entry[2])
+                    top = int(entry[4])
+                    h_px = top - bottom
+                    h_mm = h_px / effective_ppm
+                    # Filter noise outliers (< 0.5 mm specks or giant > 50 mm graphic banners)
+                    if 0.5 <= h_mm <= 50.0:
+                        heights_mm.append(h_mm)
+                except (ValueError, IndexError):
+                    continue
+
+        # Cleanup memory
+        del pil_image, processed
+        gc.collect()
+
+        if not heights_mm or len(heights_mm) < 5:
+            return {
+                "success": False,
+                "measured_font_height_mm": None,
+                "min_font_height_mm": None,
+                "characters_sampled": len(heights_mm),
+                "message": "Insufficient character samples detected for reliable font height measurement."
+            }
+
+        median_h = float(np.median(heights_mm))
+        p10_h = float(np.percentile(heights_mm, 10))
+
+        return {
+            "success": True,
+            "measured_font_height_mm": round(median_h, 2),
+            "min_font_height_mm": round(p10_h, 2),
+            "characters_sampled": len(heights_mm),
+            "message": f"Successfully measured from {len(heights_mm)} character samples."
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "measured_font_height_mm": None,
+            "min_font_height_mm": None,
+            "characters_sampled": 0,
+            "message": f"Font height measurement error: {str(e)}"
+        }

@@ -108,11 +108,18 @@ def detect_package_bbox_px(
     except Exception:
         return None
 
-    h, w = img.shape[:2]
+    orig_h, orig_w = img.shape[:2]
+    max_dim = max(orig_h, orig_w)
+    scale = 1600.0 / float(max_dim) if max_dim > 1600 else 1.0
+    if scale < 1.0:
+        small_img = cv2.resize(img, (int(orig_w * scale), int(orig_h * scale)), interpolation=cv2.INTER_AREA)
+    else:
+        small_img = img
+
+    h, w = small_img.shape[:2]
     img_area = float(w * h)
 
-
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    gray = cv2.cvtColor(small_img, cv2.COLOR_BGR2GRAY)
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
     edges = cv2.Canny(blurred, 50, 150)
 
@@ -127,19 +134,27 @@ def detect_package_bbox_px(
     min_area = 0.01 * img_area
     max_area = 0.95 * img_area
 
+    # Scale exclude_bbox_px to small_img coordinate system
+    scaled_exclude = None
+    if exclude_bbox_px is not None:
+        scaled_exclude = (
+            int(round(exclude_bbox_px[0] * scale)),
+            int(round(exclude_bbox_px[1] * scale)),
+            int(round(exclude_bbox_px[2] * scale)),
+            int(round(exclude_bbox_px[3] * scale))
+        )
+
     candidates = []
 
     for contour in contours:
         x, y, box_w, box_h = cv2.boundingRect(contour)
         box_area = float(box_w * box_h)
 
-        # Reject boxes that are too small or too large
         if box_area < min_area or box_area > max_area:
             continue
 
-        # Reject if overlapping with exclude_bbox_px (the marker)
-        if exclude_bbox_px is not None:
-            mx0, my0, mx1, my1 = exclude_bbox_px
+        if scaled_exclude is not None:
+            mx0, my0, mx1, my1 = scaled_exclude
             cx0, cy0, cx1, cy1 = x, y, x + box_w, y + box_h
 
             ix0 = max(cx0, mx0)
@@ -152,7 +167,6 @@ def detect_package_bbox_px(
             inter_area = float(inter_w * inter_h)
 
             marker_area = max(1.0, float((mx1 - mx0) * (my1 - my0)))
-            # If overlap with candidate or marker is significant (> 20%)
             if (inter_area / box_area > 0.2) or (inter_area / marker_area > 0.2):
                 continue
 
@@ -161,30 +175,140 @@ def detect_package_bbox_px(
     if not candidates:
         return None
 
-    # Pick the largest remaining candidate by bounding box area
     candidates.sort(key=lambda item: item[0], reverse=True)
-    return candidates[0][1]
+    best_x, best_y, best_w, best_h = candidates[0][1]
+
+    inv_scale = 1.0 / scale
+    return (
+        int(round(best_x * inv_scale)),
+        int(round(best_y * inv_scale)),
+        int(round(best_w * inv_scale)),
+        int(round(best_h * inv_scale))
+    )
+
+
+# Indian Circulation Coin Reference Standards (RBI Specifications)
+INR_10_COIN_DIAMETER_MM = 27.0  # Bi-metallic ₹10 Coin (27.0 mm diameter)
+INR_5_COIN_DIAMETER_MM = 25.0   # Standard ₹5 Coin (25.0 mm diameter)
+
+
+def detect_coin_reference(
+    image_bytes: bytes,
+    coin_type: str = "5_rupee"
+) -> dict | None:
+    """
+    Detects a circular Indian reference coin (₹5: 25mm or ₹10: 27mm) in the image
+    and computes the physical pixels-per-mm calibration scale.
+    Optimized with scale normalization for fast, sub-second execution on high-res photos.
+    """
+    try:
+        img = _load_cv_image(image_bytes)
+    except Exception:
+        return None
+
+    orig_h, orig_w = img.shape[:2]
+    
+    # Scale normalize image so Hough transform runs in < 1 second even on 4K/12MP photos
+    max_dim = max(orig_h, orig_w)
+    scale = 1200.0 / float(max_dim) if max_dim > 1200 else 1.0
+    if scale < 1.0:
+        small_img = cv2.resize(img, (int(orig_w * scale), int(orig_h * scale)), interpolation=cv2.INTER_AREA)
+    else:
+        small_img = img
+
+    h, w = small_img.shape[:2]
+    gray = cv2.cvtColor(small_img, cv2.COLOR_BGR2GRAY)
+    
+    # Contrast boost + smooth local engraving
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    enhanced = clahe.apply(gray)
+    blurred = cv2.GaussianBlur(enhanced, (9, 9), 2.0)
+
+    min_dim = min(h, w)
+    min_radius = max(15, int(min_dim * 0.02))
+    max_radius = max(60, int(min_dim * 0.18))
+
+    circles = cv2.HoughCircles(
+        blurred,
+        cv2.HOUGH_GRADIENT,
+        dp=1.2,
+        minDist=min_radius * 2,
+        param1=120,
+        param2=42,
+        minRadius=min_radius,
+        maxRadius=max_radius
+    )
+
+    if circles is None or len(circles) == 0:
+        return None
+
+    diameter_mm = INR_5_COIN_DIAMETER_MM if coin_type == "5_rupee" else INR_10_COIN_DIAMETER_MM
+    ref_name = "₹5 Coin (25mm)" if coin_type == "5_rupee" else "₹10 Coin (27mm)"
+
+    # Pick the strongest candidate and map back to full original image coordinates
+    cx_s, cy_s, r_s = circles[0][0]
+    inv_scale = 1.0 / scale
+    
+    cx = int(round(cx_s * inv_scale))
+    cy = int(round(cy_s * inv_scale))
+    r = float(r_s * inv_scale)
+
+    x0 = max(0, int(cx - r))
+    y0 = max(0, int(cy - r))
+    x1 = min(orig_w, int(cx + r))
+    y1 = min(orig_h, int(cy + r))
+
+    diameter_px = 2.0 * r
+    if diameter_px <= 0:
+        return None
+
+    ppm = float(diameter_px / diameter_mm)
+
+    return {
+        "reference_type": coin_type,
+        "reference_name": ref_name,
+        "pixels_per_mm": ppm,
+        "marker_bbox_px": (x0, y0, x1, y1),
+        "center": (cx, cy),
+        "radius_px": r,
+        "image_shape": (orig_h, orig_w)
+    }
 
 
 def calibrate_package_dimensions(
     image_bytes: bytes,
-    marker_size_mm: float = DEFAULT_MARKER_SIZE_MM
+    marker_size_mm: float = DEFAULT_MARKER_SIZE_MM,
+    default_coin: str = "10_rupee"
 ) -> dict:
     """
-    Orchestrates ArUco marker detection and package bounding box measurement
-    to compute real-world package dimensions in centimetres.
+    Orchestrates physical dimension calibration and package bounding box measurement
+    using either:
+      1. ArUco Marker (40mm) [Primary reference]
+      2. Indian ₹10 / ₹5 Coin [Zero-setup fallback reference]
 
     Returns:
         dict with success status, measured dimensions or descriptive error message.
     """
+    # 1. Primary: Check for ArUco Marker
     marker_info = detect_aruco_marker(image_bytes, marker_size_mm=marker_size_mm)
+    ref_name = f"ArUco Marker ({int(marker_size_mm)}mm)"
+    ref_type = "aruco_marker"
+
+    # 2. Fallback: Check for Indian Circulation Coin
+    if marker_info is None:
+        coin_info = detect_coin_reference(image_bytes, coin_type=default_coin)
+        if coin_info is not None:
+            marker_info = coin_info
+            ref_name = coin_info["reference_name"]
+            ref_type = coin_info["reference_type"]
+
     if marker_info is None:
         size_display = int(marker_size_mm) if marker_size_mm.is_integer() else marker_size_mm
         return {
             "success": False,
             "message": (
-                f"No ArUco calibration marker detected. Print the {size_display}mm marker, "
-                "place it flat next to the product (fully visible, not tilted), and rescan."
+                f"No calibration reference detected. Place a {size_display}mm ArUco marker OR an Indian ₹10 / ₹5 coin "
+                "flat next to the product (fully visible, not tilted), and rescan."
             )
         }
 
@@ -195,8 +319,8 @@ def calibrate_package_dimensions(
         return {
             "success": False,
             "message": (
-                "Calibration marker detected, but the package outline could not be isolated. "
-                "Retake the photo with the product and marker both flat, well-lit, and against a plain background."
+                f"{ref_name} detected, but the package outline could not be isolated. "
+                "Retake the photo with the product and reference both flat, well-lit, and against a plain background."
             )
         }
 
@@ -206,7 +330,7 @@ def calibrate_package_dimensions(
     if px_per_mm <= 0:
         return {
             "success": False,
-            "message": "Invalid marker calibration ratio calculated."
+            "message": "Invalid calibration ratio calculated."
         }
 
     # Convert px -> mm -> cm
@@ -215,13 +339,17 @@ def calibrate_package_dimensions(
 
     width_cm = round(width_mm / 10.0, 2)
     height_cm = round(height_mm / 10.0, 2)
+    area_cm2 = round(width_cm * height_cm, 2)
 
     return {
         "success": True,
         "height_cm": height_cm,
         "width_cm": width_cm,
+        "area_cm2": area_cm2,
         "pixels_per_mm": round(px_per_mm, 3),
-        "marker_id": marker_info["marker_id"]
+        "reference_type": ref_type,
+        "reference_name": ref_name,
+        "marker_id": marker_info.get("marker_id")
     }
 
 

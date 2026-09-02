@@ -3,7 +3,11 @@ from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.responses import HTMLResponse, FileResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 
-from ocr_engine import extract_text_lines_from_image, extract_text_lines_with_confidence
+from ocr_engine import (
+    extract_text_lines_from_image,
+    extract_text_lines_with_confidence,
+    measure_font_height_mm
+)
 from rules_engine import evaluate_all_rules
 from report_generator import generate_pdf_report
 from calibration import generate_marker_png_bytes, calibrate_package_dimensions
@@ -116,22 +120,17 @@ UI_HTML = """
                         <div class="bg-slate-900/50 border border-slate-700/60 rounded-xl p-3.5 space-y-3">
                             <div class="flex items-center justify-between">
                                 <p class="text-xs font-semibold text-slate-300 flex items-center gap-1.5">
-                                    <i class="fa-solid fa-qrcode text-blue-400"></i> Physical Dimension Calibration
+                                    <i class="fa-solid fa-ruler-combined text-blue-400"></i> Physical Calibration Reference
                                 </p>
                                 <a href="/api/calibration-marker" target="_blank"
                                     class="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-[11px] font-medium bg-blue-600/20 text-blue-400 hover:bg-blue-600/30 border border-blue-500/30 transition">
                                     <i class="fa-solid fa-print text-xs"></i>
-                                    <span>Get Marker</span>
+                                    <span>Get 40mm Marker</span>
                                 </a>
                             </div>
                             <p class="text-[11px] text-slate-400 leading-relaxed">
-                                Package height & width are measured automatically. Print the calibration marker and place it flat next to the product, fully visible, before photographing.
+                                <span class="text-slate-200 font-medium">Auto-Measured:</span> Place a <span class="text-amber-400 font-semibold">₹10 or ₹5 Indian coin</span> OR a <span class="text-blue-400 font-semibold">40mm ArUco marker</span> flat next to the product. Package dimensions, PDP area, and Rule 7(2) font height are calculated automatically.
                             </p>
-                            <div>
-                                <label class="block text-[11px] text-slate-400 mb-1">Detected Font Height (mm)</label>
-                                <input type="number" step="0.1" id="font_height" value="2.5"
-                                    class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-1.5 text-xs text-white focus:outline-none focus:border-blue-500">
-                            </div>
                         </div>
 
                         <!-- Submit Button -->
@@ -280,7 +279,10 @@ UI_HTML = """
 
             const formData = new FormData();
             formData.append('file', fileInput.files[0]);
-            formData.append('detected_font_height_mm', document.getElementById('font_height').value || 2.5);
+            const fontEl = document.getElementById('font_height');
+            if (fontEl && fontEl.value) {
+                formData.append('detected_font_height_mm', fontEl.value);
+            }
 
             // Toggle States
             document.getElementById('emptyState').classList.add('hidden');
@@ -326,8 +328,14 @@ UI_HTML = """
                 if (cal.success) {
                     calCard.className = 'rounded-xl p-3.5 flex items-center justify-between text-xs border bg-emerald-950/40 border-emerald-500/30 text-emerald-300';
                     calIcon.innerHTML = '<i class="fa-solid fa-ruler-combined text-emerald-400 text-lg"></i>';
-                    calTitle.innerText = `Calibrated via marker ID ${cal.marker_id}: ${cal.height_cm}cm × ${cal.width_cm}cm detected automatically`;
-                    calSubtitle.innerText = `Scale ratio: ${cal.pixels_per_mm} px/mm`;
+                    
+                    let fontTag = '';
+                    if (data.font_measurement && data.font_measurement.success) {
+                        fontTag = ` • Auto-Font: ${data.font_measurement.measured_font_height_mm}mm (${data.font_measurement.characters_sampled} chars)`;
+                    }
+                    const refLabel = cal.reference_name || (cal.marker_id !== undefined ? `ArUco ID ${cal.marker_id}` : 'Reference Marker');
+                    calTitle.innerText = `Calibrated via ${refLabel}: ${cal.height_cm}cm × ${cal.width_cm}cm${fontTag}`;
+                    calSubtitle.innerText = `PDP Area: ${cal.area_cm2 || (cal.height_cm * cal.width_cm).toFixed(1)} cm² • Scale: ${cal.pixels_per_mm} px/mm`;
                 } else {
                     calCard.className = 'rounded-xl p-3.5 flex items-center justify-between text-xs border bg-amber-950/40 border-amber-500/30 text-amber-300';
                     calIcon.innerHTML = '<i class="fa-solid fa-triangle-exclamation text-amber-400 text-lg"></i>';
@@ -448,11 +456,11 @@ def get_user_interface():
 @app.post("/api/scan-image")
 async def scan_package_image(
     file: UploadFile = File(...),
-    detected_font_height_mm: float = Form(2.5)
+    detected_font_height_mm: float = Form(None)
 ):
     """
     Ingests label image bytes, extracts OCR tokens, calibrates physical package dimensions,
-    runs LMPC validation, and caches the latest report for PDF export.
+    measures font height in millimeters automatically, runs LMPC validation, and caches report.
     """
     global latest_report_cache
     
@@ -466,6 +474,7 @@ async def scan_package_image(
     pkg_h = calibration.get("height_cm") if calibration.get("success") else None
     pkg_w = calibration.get("width_cm") if calibration.get("success") else None
     cal_err = calibration.get("message") if not calibration.get("success") else None
+    ppm = calibration.get("pixels_per_mm") if calibration.get("success") else None
 
     # 2. OCR text line extraction with per-line confidence scores
     detected_lines = extract_text_lines_with_confidence(image_bytes)
@@ -474,12 +483,24 @@ async def scan_package_image(
     confs = [item["confidence"] for item in detected_lines if item.get("confidence") is not None]
     avg_conf = round(float(sum(confs) / len(confs)), 1) if confs else 0.0
 
-    # 3. LMPC statutory rules evaluation
+    # 3. Automatic Font Height Measurement via ArUco calibration scale
+    font_measurement = None
+    effective_font_height_mm = None
+    if calibration.get("success") and ppm and ppm > 0:
+        font_measurement = measure_font_height_mm(image_bytes, ppm)
+        if font_measurement.get("success"):
+            effective_font_height_mm = font_measurement.get("measured_font_height_mm")
+
+    # Fallback to manual form value if provided and auto-measurement was unavailable
+    if effective_font_height_mm is None and detected_font_height_mm is not None and detected_font_height_mm > 0:
+        effective_font_height_mm = detected_font_height_mm
+
+    # 4. LMPC statutory rules evaluation
     compliance_results = evaluate_all_rules(
         raw_lines=raw_lines,
         package_height_cm=pkg_h,
         package_width_cm=pkg_w,
-        detected_font_height_mm=detected_font_height_mm,
+        detected_font_height_mm=effective_font_height_mm,
         dimension_calibration_error=cal_err
     )
 
@@ -488,6 +509,7 @@ async def scan_package_image(
         "detected_lines": detected_lines,
         "detected_raw_lines": raw_lines,
         "average_confidence": avg_conf,
+        "font_measurement": font_measurement,
         "compliance_report": compliance_results,
         "dimension_calibration": calibration
     }

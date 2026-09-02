@@ -1,0 +1,24 @@
+{
+  "image_path": "test_label_food.png",
+  "name": "Organic Roasted Almonds Label",
+  "characteristics": ["standard_flat", "synthetic", "high_contrast"],
+  "ground_truth_lines": [
+    "ORGANIC ROASTED ALMONDS",
+    "Net Quantity: 250 g",
+    "MRP: Rs. 199.00 (Incl. of all taxes)",
+    "Unit Sale Price (USP): Rs. 0.80 / g",
+    "Date of Pkg: 03/2026",
+    "Manufactured by: Pramand Foods Pvt Ltd, Pune 411001",
+    "Consumer Care: support@pramand.com, Toll Free: 1800-222-3333",
+    "Country of Origin: India"
+  ],
+  "statutory_fields": {
+    "mrp": "MRP: Rs. 199.00 (Incl. of all taxes)",
+    "manufacturer": "Manufactured by: Pramand Foods Pvt Ltd, Pune 411001",
+    "net_quantity": "250 g",
+    "mfg_date": "03/2026",
+    "consumer_care": "1800-222-3333",
+    "country_of_origin": "India",
+    "unit_sale_price": "Rs. 0.80 / g"
+  }
+}
